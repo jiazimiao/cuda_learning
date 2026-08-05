@@ -27,7 +27,7 @@ __global__ void matrixAdd(
     if(row < N && col < N)
     {
         C[index] =
-            A[index] * B[index];
+            A[index] + B[index];
     }
 }
 
