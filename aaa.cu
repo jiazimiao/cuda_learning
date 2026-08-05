@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
-#define N 1000
+#define N 10000
 
 
 __global__ void matrixAdd(
@@ -26,7 +26,7 @@ __global__ void matrixAdd(
     if(row < N && col < N)
     {
         C[index] =
-            A[index] + B[index];
+            A[index] * B[index];
     }
 }
 
