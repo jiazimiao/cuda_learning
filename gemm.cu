@@ -6,7 +6,7 @@
 #include <cuda_runtime.h>
 #define N 4*1024
 
-__global__ void matrixAdd(
+__global__ void gemm(
     float *A,
     float *B,
     float *C)
@@ -23,8 +23,12 @@ __global__ void matrixAdd(
 
     if (row < N && col < N)
     {
-        C[index] =
-            A[index] + B[index];
+        float sum = 0.0f;
+        for (int k = 0; k < N; ++k)
+        {
+            sum += A[row * N + k] * B[k * N + col];
+        }
+        C[index] = sum;
     }
 }
 
@@ -37,12 +41,22 @@ void initArray(float* A, int length)
     }
 }
 
-void serialVecAdd(float* A, float* B, float* C,  int length)
+void serialVecAdd(float* A, float* B, float* C,  int M, int K, int N)
 {
-    for(int i=0; i<length; i++)
+    for(int i=0; i<M; i++)
     {
-        C[i] = A[i] + B[i];
+        for(int j = 0; j < N; j++)
+        {
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k)
+            {
+                sum += A[i * K + k] * B[k * N + j];
+            }
+            C[i * N + j] = sum;
+        }
+        
     }
+    
 }
 
 bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00001)
@@ -103,10 +117,10 @@ int main()
     dim3 block(1024,1024);
     dim3 grid(4,4);
 
-    matrixAdd<<<block, grid>>>(d_A, d_B, d_C);
+    gemm<<<block, grid>>>(d_A, d_B, d_C);
 
     cudaDeviceSynchronize();
-    serialVecAdd(A, B, comparisonResult, vectorLength);
+    serialVecmul(A, B, comparisonResult, N,N,N);
 
     // GPU -> CPU
 
@@ -118,11 +132,11 @@ int main()
 
     if(vectorApproximatelyEqual(C, comparisonResult, vectorLength))
     {
-        printf("Unified Memory: CPU and GPU answers match\n");
+        printf("CPU and GPU answers match\n");
     }
     else
     {
-        printf("Unified Memory: Error - CPU and GPU answers do not match\n");
+        printf("Error - CPU and GPU answers do not match\n");
     }
 
     cudaFree(d_A);
