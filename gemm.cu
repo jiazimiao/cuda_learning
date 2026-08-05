@@ -41,7 +41,7 @@ void initArray(float* A, int length)
     }
 }
 
-void serialVecAdd(float* A, float* B, float* C,  int M, int K, int L)
+void serialVecmul(float* A, float* B, float* C,  int M, int K, int L)
 {
     for(int i=0; i<M; i++)
     {
@@ -120,7 +120,7 @@ int main()
     gemm<<<block, grid>>>(d_A, d_B, d_C);
 
     cudaDeviceSynchronize();
-    serialVecmul(A, B, comparisonResult, N,N,N);
+    serialVecmul(A, B, comparisonResult, 1024,1024,1024);
 
     // GPU -> CPU
 
