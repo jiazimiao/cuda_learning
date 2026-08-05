@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <cuda_runtime.h>
-#define N 10000
+#define N 100000
 
 
 __global__ void matrixAdd(
