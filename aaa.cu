@@ -129,9 +129,12 @@ int main()
     cudaFree(d_B);
     cudaFree(d_C);
 
-    free(A);
-    free(B);
-    free(C);
+    // free(A);
+    // free(B);
+    // free(C);
+    cudaFreeHost(A);
+    cudaFreeHost(B);
+    cudaFreeHost(C);
 
     return 0;
 }
