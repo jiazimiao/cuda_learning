@@ -41,18 +41,18 @@ void initArray(float* A, int length)
     }
 }
 
-void serialVecAdd(float* A, float* B, float* C,  int M, int K, int N)
+void serialVecAdd(float* A, float* B, float* C,  int M, int K, int L)
 {
     for(int i=0; i<M; i++)
     {
-        for(int j = 0; j < N; j++)
+        for(int j = 0; j < L; j++)
         {
             float sum = 0.0f;
             for (int k = 0; k < K; ++k)
             {
-                sum += A[i * K + k] * B[k * N + j];
+                sum += A[i * K + k] * B[k * L + j];
             }
-            C[i * N + j] = sum;
+            C[i * L + j] = sum;
         }
         
     }
