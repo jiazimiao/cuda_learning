@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <iostream>
 #include <cuda_runtime.h>
-#define N 100000
+#define N 20000
 
 
 __global__ void matrixAdd(
@@ -20,7 +20,7 @@ __global__ void matrixAdd(
         + threadIdx.x;
 
 
-    long index =
+    int index =
         row * N + col;
 
 
@@ -75,7 +75,7 @@ int main()
 
 
 
-    for(long i=0;i<N*N;i++)
+    for(int i=0;i<N*N;i++)
     {
         A[i]=1.0;
         B[i]=2.0;
