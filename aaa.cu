@@ -36,6 +36,26 @@ int main()
 {
 
 
+       int device;
+
+    cudaGetDevice(&device);
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+
+    std::cout << "Current CUDA device: " << device << std::endl;
+    std::cout << "GPU name: " << prop.name << std::endl;
+    std::cout << "Compute Capability: "
+              << prop.major << "."
+              << prop.minor << std::endl;
+
+    std::cout << "SM count: "
+              << prop.multiProcessorCount << std::endl;
+
+    std::cout << "Global memory: "
+              << prop.totalGlobalMem / 1024 / 1024
+              << " MB" << std::endl;
+
 
     size_t size =
         N*N*sizeof(float);
