@@ -19,7 +19,7 @@ __global__ void matrixAdd(
         + threadIdx.x;
 
 
-    int index =
+    long index =
         row * N + col;
 
 
@@ -52,7 +52,7 @@ int main()
 
 
 
-    for(int i=0;i<N*N;i++)
+    for(long i=0;i<N*N;i++)
     {
         A[i]=1.0;
         B[i]=2.0;
