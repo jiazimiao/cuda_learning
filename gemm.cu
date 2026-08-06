@@ -4,7 +4,7 @@
 #include <ctime>
 #include <cuda/cmath>
 #include <cuda_runtime.h>
-#define N 4*1024
+#define N 128
 
 __global__ void gemm(
     float *A,
@@ -59,7 +59,7 @@ void serialVecmul(float* A, float* B, float* C,  int M, int K, int L)
     
 }
 
-bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=0.00001)
+bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=1e-4f)
 {
     for(int i=0; i<length; i++)
     {
@@ -113,9 +113,9 @@ int main()
     // define block
 
     dim3 block(16, 16);
-    // dim3 grid((N + block.x - 1) / block.x,
-            //   (N + block.y - 1) / block.y);
-    dim3 grid(256, 256);
+    dim3 grid((N + block.x - 1) / block.x,
+              (N + block.y - 1) / block.y);
+  
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
