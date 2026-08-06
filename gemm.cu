@@ -4,7 +4,7 @@
 #include <ctime>
 #include <cuda/cmath>
 #include <cuda_runtime.h>
-#define N 128
+#define N 512
 
 __global__ void gemm(
     float *A,
