@@ -4,7 +4,7 @@
 #include <ctime>
 #include <cuda/cmath>
 #include <cuda_runtime.h>
-#define N 1024
+#define N 4096
 #define TILE_WIDTH 32
 
 __global__ void gemm(
