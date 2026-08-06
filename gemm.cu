@@ -112,7 +112,7 @@ int main()
 
     // define block
 
-    dim3 block(16, 16);
+    dim3 block(32, 32);
     dim3 grid((N + block.x - 1) / block.x,
               (N + block.y - 1) / block.y);
   
