@@ -112,14 +112,37 @@ int main()
 
     // define block
 
-    // dim3 block(16, 16);
-    // dim3 grid((N + 15) / 16, (N + 15) / 16);
-    dim3 block(1024,1024);
-    dim3 grid(4,4);
+    dim3 block(16, 16);
+    // dim3 grid((N + block.x - 1) / block.x,
+            //   (N + block.y - 1) / block.y);
+    dim3 grid(256, 256);
 
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
     gemm<<<grid, block>>>(d_A, d_B, d_C);
+    cudaEventRecord(stop);
 
-    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+    {
+        printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    err = cudaEventSynchronize(stop);
+    if (err != cudaSuccess)
+    {
+        printf("Kernel execution failed: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+
+    float kernelMilliseconds = 0.0f;
+    cudaEventElapsedTime(&kernelMilliseconds, start, stop);
+    printf("GEMM kernel time: %.3f ms\n", kernelMilliseconds);
+
     serialVecmul(A, B, comparisonResult, N, N, N);
 
     // GPU -> CPU
@@ -142,6 +165,8 @@ int main()
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     // free(A);
     // free(B);
