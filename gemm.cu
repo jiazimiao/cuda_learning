@@ -117,10 +117,10 @@ int main()
     dim3 block(1024,1024);
     dim3 grid(4,4);
 
-    gemm<<<block, grid>>>(d_A, d_B, d_C);
+    gemm<<<grid, block>>>(d_A, d_B, d_C);
 
     cudaDeviceSynchronize();
-    serialVecmul(A, B, comparisonResult, 1024,1024,1024);
+    serialVecmul(A, B, comparisonResult, N, N, N);
 
     // GPU -> CPU
 
