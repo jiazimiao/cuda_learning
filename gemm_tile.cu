@@ -5,7 +5,7 @@
 #include <cuda/cmath>
 #include <cuda_runtime.h>
 #define N 4096
-#define TILE_WIDTH 32
+#define TILE_WIDTH 16
 
 __global__ void gemm(
     float *A,
