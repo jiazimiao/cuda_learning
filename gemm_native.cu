@@ -4,7 +4,7 @@
 #include <ctime>
 #include <cuda/cmath>
 #include <cuda_runtime.h>
-#define N 4*1024
+#define N 128
 
 __global__ void gemm(
     float *A,
@@ -112,7 +112,7 @@ int main()
 
     // define block
 
-    dim3 block(16, 16);
+    dim3 block(32, 32);
     dim3 grid((N + block.x - 1) / block.x,
               (N + block.y - 1) / block.y);
   
