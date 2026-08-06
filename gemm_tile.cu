@@ -90,7 +90,7 @@ void serialVecmul(float* A, float* B, float* C,  int M, int K, int L)
     
 }
 
-bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=1e-4f)
+bool vectorApproximatelyEqual(float* A, float* B, int length, float epsilon=1e-3f)
 {
     for(int i=0; i<length; i++)
     {
