@@ -5,7 +5,7 @@
 #include <cuda/cmath>
 #include <cuda_runtime.h>
 #define N 4096
-#define TILE_WIDTH 16
+#define TILE_WIDTH 32
 
 __global__ void gemm(
     float *A,
@@ -27,23 +27,34 @@ __global__ void gemm(
 
     for(int tile = 0;tile<(N+TILE_WIDTH-1)/TILE_WIDTH;tile++)
     {
-        if(row<N && tile*TILE_WIDTH+threadIdx.x<N)
-        {
-            tileA[threadIdx.y][threadIdx.x] = A[row*N + tile*TILE_WIDTH + threadIdx.x];
-        }
-        else
-        {
-            tileA[threadIdx.y][threadIdx.x] = 0.0f;
-        }
+        int aCol = tile * TILE + threadIdx.x;
+        int bRow = tile * TILE + threadIdx.y;
 
-        if(col<N && tile*TILE_WIDTH+threadIdx.y<N)
-        {
-            tileB[threadIdx.y][threadIdx.x] = B[(tile*TILE_WIDTH + threadIdx.y)*N + col];
-        }
-        else
-        {
-            tileB[threadIdx.y][threadIdx.x] = 0.0f;
-        }
+        // 256 个线程各自加载 A、B 的一个元素
+        // 边界外补 0，以支持 N 不是 TILE 整数倍的情况。
+        sharedA[ty][tx] =
+            (row < N && aCol < N) ? A[row * N + aCol] : 0.0f;
+
+        sharedB[ty][tx] =
+            (bRow < N && col < N) ? B[bRow * N + col] : 0.0f;
+
+        // if(row<N && tile*TILE_WIDTH+threadIdx.x<N)
+        // {
+        //     tileA[threadIdx.y][threadIdx.x] = A[row*N + tile*TILE_WIDTH + threadIdx.x];
+        // }
+        // else
+        // {
+        //     tileA[threadIdx.y][threadIdx.x] = 0.0f;
+        // }
+
+        // if(col<N && tile*TILE_WIDTH+threadIdx.y<N)
+        // {
+        //     tileB[threadIdx.y][threadIdx.x] = B[(tile*TILE_WIDTH + threadIdx.y)*N + col];
+        // }
+        // else
+        // {
+        //     tileB[threadIdx.y][threadIdx.x] = 0.0f;
+        // }
 
         __syncthreads();
 
