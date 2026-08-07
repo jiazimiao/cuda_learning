@@ -5,76 +5,75 @@
 #include <cuda/cmath>
 #include <cuda_runtime.h>
 #define N 4096
-#define TILE_M 32
-#define TILE_N 32
-#define TILE_K 16
-#define BLOCK_SIZE 16
+#define THREAD_TILE 16
+#define BM 32
+#define BN 32
+#define BK 16
 
 __global__ void gemm(
     float *A,
     float *B,
     float *C)
 {
-    __shared__ float tileA[BLOCK_SIZE][TILE_WIDTH];
-    __shared__ float tileB[TILE_WIDTH][TILE_WIDTH];
+    // A block has 16x16 threads and computes a 32x32 C tile.
+    // Each thread accumulates a 2x2 C micro-tile in registers.
+    __shared__ float tileA[BM][BK];
+    __shared__ float tileB[BK][BN];
 
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int row0 = blockIdx.y * BM + ty;
+    const int row1 = row0 + THREAD_TILE;
+    const int col0 = blockIdx.x * BN + tx;
+    const int col1 = col0 + THREAD_TILE;
 
-    int row =
-        blockIdx.y * TILE_WIDTH + threadIdx.y;
+    float sum00 = 0.0f;
+    float sum01 = 0.0f;
+    float sum10 = 0.0f;
+    float sum11 = 0.0f;
 
-    int col =
-        blockIdx.x * TILE_WIDTH + threadIdx.x;
-
-
-
-float sum = 0.0f;
-    for(int tile = 0;tile<(N+TILE_WIDTH-1)/TILE_WIDTH;tile++)
+    for (int tile = 0; tile < (N + BK - 1) / BK; ++tile)
     {
-        int aCol = tile * TILE_WIDTH + threadIdx.x;
-        int bRow = tile * TILE_WIDTH + threadIdx.y;
+        const int kA = tile * BK + tx;
+        const int kB = tile * BK + ty;
 
-        // 256 个线程各自加载 A、B 的一个元素
-        // 边界外补 0，以支持 N 不是 TILE 整数倍的情况。
-        tileA[threadIdx.y][threadIdx.x] =
-            (row < N && aCol < N) ? A[row * N + aCol] : 0.0f;
+        // Each thread loads two A values and two B values.
+        // Out-of-range elements are zero-filled for edge tiles.
+        tileA[ty][tx] =
+            (row0 < N && kA < N) ? A[row0 * N + kA] : 0.0f;
+        tileA[ty + THREAD_TILE][tx] =
+            (row1 < N && kA < N) ? A[row1 * N + kA] : 0.0f;
 
-        tileB[threadIdx.y][threadIdx.x] =
-            (bRow < N && col < N) ? B[bRow * N + col] : 0.0f;
+        tileB[ty][tx] =
+            (kB < N && col0 < N) ? B[kB * N + col0] : 0.0f;
+        tileB[ty][tx + THREAD_TILE] =
+            (kB < N && col1 < N) ? B[kB * N + col1] : 0.0f;
     
-
-        // if(row<N && tile*TILE_WIDTH+threadIdx.x<N)
-        // {
-        //     tileA[threadIdx.y][threadIdx.x] = A[row*N + tile*TILE_WIDTH + threadIdx.x];
-        // }
-        // else
-        // {
-        //     tileA[threadIdx.y][threadIdx.x] = 0.0f;
-        // }
-
-        // if(col<N && tile*TILE_WIDTH+threadIdx.y<N)
-        // {
-        //     tileB[threadIdx.y][threadIdx.x] = B[(tile*TILE_WIDTH + threadIdx.y)*N + col];
-        // }
-        // else
-        // {
-        //     tileB[threadIdx.y][threadIdx.x] = 0.0f;
-        // }
 
         __syncthreads();
 
-        for(int k=0;k<TILE_WIDTH;k++)
+        #pragma unroll
+        for (int k = 0; k < BK; ++k)
         {
-            sum += tileA[threadIdx.y][k]*tileB[k][threadIdx.x];
+            const float a0 = tileA[ty][k];
+            const float a1 = tileA[ty + THREAD_TILE][k];
+            const float b0 = tileB[k][tx];
+            const float b1 = tileB[k][tx + THREAD_TILE];
+
+            sum00 += a0 * b0;
+            sum01 += a0 * b1;
+            sum10 += a1 * b0;
+            sum11 += a1 * b1;
         }
 
         __syncthreads();
 
         
     }
-    if(row<N && col<N)
-        {
-            C[row*N + col] = sum;
-        }
+    if (row0 < N && col0 < N) C[row0 * N + col0] = sum00;
+    if (row0 < N && col1 < N) C[row0 * N + col1] = sum01;
+    if (row1 < N && col0 < N) C[row1 * N + col0] = sum10;
+    if (row1 < N && col1 < N) C[row1 * N + col1] = sum11;
 
 }
 
@@ -158,9 +157,9 @@ int main()
 
     // define block
 
-    dim3 block(TILE_WIDTH, TILE_WIDTH);
-    dim3 grid((N + block.x - 1) / block.x,
-              (N + block.y - 1) / block.y);
+    dim3 block(THREAD_TILE, THREAD_TILE);
+    dim3 grid((N + BN - 1) / BN,
+              (N + BM - 1) / BM);
   
 
     cudaEvent_t start, stop;
