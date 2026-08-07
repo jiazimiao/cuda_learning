@@ -24,7 +24,7 @@ __global__ void gemm(
 
 
 
-
+float sum = 0.0f;
     for(int tile = 0;tile<(N+TILE_WIDTH-1)/TILE_WIDTH;tile++)
     {
         int aCol = tile * TILE_WIDTH + threadIdx.x;
@@ -37,6 +37,7 @@ __global__ void gemm(
 
         tileB[threadIdx.y][threadIdx.x] =
             (bRow < N && col < N) ? B[bRow * N + col] : 0.0f;
+    
 
         // if(row<N && tile*TILE_WIDTH+threadIdx.x<N)
         // {
@@ -58,7 +59,6 @@ __global__ void gemm(
 
         __syncthreads();
 
-        float sum = 0.0f;
         for(int k=0;k<TILE_WIDTH;k++)
         {
             sum += tileA[threadIdx.y][k]*tileB[k][threadIdx.x];
@@ -66,11 +66,12 @@ __global__ void gemm(
 
         __syncthreads();
 
-        if(row<N && col<N)
-        {
-            C[row*N + col] += sum;
-        }
+        
     }
+    if(row<N && col<N)
+        {
+            C[row*N + col] = sum;
+        }
 
 }
 
