@@ -27,15 +27,15 @@ __global__ void gemm(
 
     for(int tile = 0;tile<(N+TILE_WIDTH-1)/TILE_WIDTH;tile++)
     {
-        int aCol = tile * TILE + threadIdx.x;
-        int bRow = tile * TILE + threadIdx.y;
+        int aCol = tile * TILE_WIDTH + threadIdx.x;
+        int bRow = tile * TILE_WIDTH + threadIdx.y;
 
         // 256 个线程各自加载 A、B 的一个元素
         // 边界外补 0，以支持 N 不是 TILE 整数倍的情况。
-        sharedA[ty][tx] =
+        sharedA[threadIdx.y][threadIdx.x] =
             (row < N && aCol < N) ? A[row * N + aCol] : 0.0f;
 
-        sharedB[ty][tx] =
+        sharedB[threadIdx.y][threadIdx.x] =
             (bRow < N && col < N) ? B[bRow * N + col] : 0.0f;
 
         // if(row<N && tile*TILE_WIDTH+threadIdx.x<N)
