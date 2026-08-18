@@ -40,17 +40,17 @@
 	or.pred  	%p3, %p1, %p2;
 	@%p3 bra 	$L__BB0_4;
 
-	shl.b32 	%r13, %r1, 12;
-	mul.wide.s32 	%rd1, %r2, 4;
+	shl.b32 	%r13, %r1, 12;//A/C的起始下标
+	mul.wide.s32 	%rd1, %r2, 4;//B的偏移
 	or.b32  	%r14, %r13, 1;
 	mul.wide.s32 	%rd2, %r14, 4;
 	mul.wide.s32 	%rd3, %r13, 4;
 	add.s32 	%r3, %r13, %r2;
-	cvta.to.global.u64 	%rd4, %rd13;
-	cvta.to.global.u64 	%rd19, %rd11;
-	cvta.to.global.u64 	%rd20, %rd12;
-	mov.f32 	%f51, 0f00000000;
-	mov.u32 	%r15, 0;
+	cvta.to.global.u64 	%rd4, %rd13;//C
+	cvta.to.global.u64 	%rd19, %rd11;//A
+	cvta.to.global.u64 	%rd20, %rd12; //B
+	mov.f32 	%f51, 0f00000000;//sum = 0.0f
+	mov.u32 	%r15, 0; //k_step = 0
 
 $L__BB0_2:
 	add.s64 	%rd14, %rd19, %rd3;
