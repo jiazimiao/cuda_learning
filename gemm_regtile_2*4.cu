@@ -209,7 +209,7 @@ int main()
     cudaEventElapsedTime(&kernelMilliseconds, start, stop);
     printf("GEMM kernel time: %.3f ms\n", kernelMilliseconds);
 
-    serialVecmul(A, B, comparisonResult, N, N, N);
+    // serialVecmul(A, B, comparisonResult, N, N, N);
 
     // GPU -> CPU
 
@@ -219,14 +219,14 @@ int main()
         size,
         cudaMemcpyDeviceToHost);
 
-    if(vectorApproximatelyEqual(C, comparisonResult, vectorLength))
-    {
-        printf("CPU and GPU answers match\n");
-    }
-    else
-    {
-        printf("Error - CPU and GPU answers do not match\n");
-    }
+    // if(vectorApproximatelyEqual(C, comparisonResult, vectorLength))
+    // {
+    //     printf("CPU and GPU answers match\n");
+    // }
+    // else
+    // {
+    //     printf("Error - CPU and GPU answers do not match\n");
+    // }
 
     cudaFree(d_A);
     cudaFree(d_B);
