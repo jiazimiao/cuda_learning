@@ -1,3 +1,4 @@
+//tensor core初版：使用简单的sharedmemory搬运数据+wmma（load+mma+store）实现矩阵乘法
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -56,7 +57,8 @@ __global__ void gemm_tensorcore(
     fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
 
     fill_fragment(c_frag, 0.0f);
-
+                  
+    //global M ->shared M
     #pragma unroll
     for (int tile_k = 0; tile_k < N; tile_k += WMMA_K)
     {
@@ -79,7 +81,7 @@ __global__ void gemm_tensorcore(
         }
 
         __syncwarp();
-
+        //shared M -> register(fragment,方便后续tensorcore使用)
         load_matrix_sync(a_frag, &sA[0][0], WMMA_K);
         load_matrix_sync(b_frag, &sB[0][0], WMMA_N);
         mma_sync(c_frag, a_frag, b_frag, c_frag);
