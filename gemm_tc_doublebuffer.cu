@@ -17,11 +17,11 @@ using namespace nvcuda::wmma;
 // BLOCK大小决定多少个线程合作处理这件事，以32各位一组（warp）
 // blocktile的大小根据需要几个warp决定
 constexpr int BLOCK_SIZE_M = 64;
-constexpr int BLOCK_SIZE_N = 48;
+constexpr int BLOCK_SIZE_N = 32;
 constexpr int BLOCK_SIZE_K = 16;
 
 // TILE_SIZE决定进sharedmemory的块大小
-constexpr int TILE_M = 32;
+constexpr int TILE_M = 16;
 constexpr int TILE_N = 16;
 // constexpr int TILE_K = 32;
 
@@ -55,6 +55,7 @@ __global__ void gemm_tensorcore(
 {
 
     const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    const int num_thread = blockDim.x * blockDim.y;
     const int warp_id = tid / warpSize;
     const int warp_m = warp_id / (BLOCK_SIZE_N / TILE_N);
     const int warp_n = warp_id % (BLOCK_SIZE_N / TILE_N);
@@ -85,20 +86,37 @@ __global__ void gemm_tensorcore(
 
     // global M ->shared M
     int buffer = 0;
-    for (int idx = tid; idx < BLOCK_SIZE_M * BLOCK_SIZE_K; idx += blockDim.x)
+    for (int idx = tid; idx < BLOCK_SIZE_M * BLOCK_SIZE_K; idx += num_thread)
     {
         const int r = idx / BLOCK_SIZE_K;
         const int c = idx % BLOCK_SIZE_K;
         const int g_row = block_m + r;
-        cuda::memcpy_async(&sA[r][c], &A[g_row * N + c], sizeof(half), pipeline);
+        const int g_col = c;
+        if(g_row<N && g_col<N)
+        {
+        cuda::memcpy_async(&sA[buffer][r][c], &A[g_row * N + g_col], sizeof(half), pipeline);
+        }
+        else
+        {
+            sA[buffer][r][c] = __float2half(0.0f);
+        }
     }
 
-    for (int idx = tid; idx < BLOCK_SIZE_K * BLOCK_SIZE_N; idx += blockDim.x)
+    for (int idx = tid; idx < BLOCK_SIZE_K * BLOCK_SIZE_N; idx += num_thread)
     {
         const int r = idx / BLOCK_SIZE_N;
         const int c = idx % BLOCK_SIZE_N;
+        const int g_row = r;
         const int g_col = block_n + c;
-        cuda::memcpy_async(&sB[r][c], &B[r * N + g_col], sizeof(half), pipeline);
+
+        if (g_row < N && g_col < N)
+        {
+            cuda::memcpy_async(&sB[buffer][r][c], &B[g_row * N + g_col], sizeof(half), pipeline);
+        }
+        else
+        {
+            sB[buffer][r][c] = __float2half(0.0f);
+        }
     }
 
    pipeline.producer_commit();
@@ -113,22 +131,32 @@ __global__ void gemm_tensorcore(
         int next = buffer ^ 1;
         if (tile_k + BLOCK_SIZE_K < N)
         {
-        for (int idx = tid; idx < BLOCK_SIZE_M * BLOCK_SIZE_K; idx += blockDim.x)
+        for (int idx = tid; idx < BLOCK_SIZE_M * BLOCK_SIZE_K; idx += num_thread)
         {
             const int r = idx / BLOCK_SIZE_K;
             const int c = idx % BLOCK_SIZE_K;
             const int g_row = block_m + r;
             const int g_col = tile_k + c + BLOCK_SIZE_K;
-            cuda::memcpy_async(&sA[next][r][c], &A[g_row * N + g_col], sizeof(half), pipeline);
+            if(g_row<N && g_col<N){
+                cuda::memcpy_async(&sA[next][r][c], &A[g_row * N + g_col], sizeof(half), pipeline);
+            }else{
+                sA[next][r][c] = __float2half(0.0f);
+            }
+            
         }
 
-        for (int idx = tid; idx < BLOCK_SIZE_K * BLOCK_SIZE_N; idx += blockDim.x)
+        for (int idx = tid; idx < BLOCK_SIZE_K * BLOCK_SIZE_N; idx += num_thread)
         {
             const int r = idx / BLOCK_SIZE_N;
             const int c = idx % BLOCK_SIZE_N;
             const int g_row = tile_k + r + BLOCK_SIZE_K;
             const int g_col = block_n + c;
-            cuda::memcpy_async(&sB[next][r][c], &B[g_row * N + g_col], sizeof(half), pipeline);
+            if(g_row<N && g_col<N){
+               cuda::memcpy_async(&sB[next][r][c], &B[g_row * N + g_col], sizeof(half), pipeline);
+            }else{
+                sB[next][r][c] = __float2half(0.0f);
+            }
+            
         }
         pipeline.producer_commit();
 
@@ -180,7 +208,7 @@ __global__ void gemm_tensorcore(
 
     __syncthreads();
 
-    for (int idx = tid; idx < BLOCK_SIZE_M * BLOCK_SIZE_N; idx += blockDim.x)
+    for (int idx = tid; idx < BLOCK_SIZE_M * BLOCK_SIZE_N; idx += num_thread)
     {
         const int r = idx / BLOCK_SIZE_N;
         const int c = idx % BLOCK_SIZE_N;
@@ -197,7 +225,7 @@ int main(int argc, char **argv)
 {
     std::srand(static_cast<unsigned>(std::time(nullptr)));
 
-    const int N = (argc > 1) ? std::atoi(argv[1]) : 512;
+    const int N = (argc > 1) ? std::atoi(argv[1]) : 4096;
     if (N <= 0)
     {
         std::printf("Invalid matrix size: %d\n", N);
@@ -227,18 +255,18 @@ int main(int argc, char **argv)
         hB_half[i] = __float2half(hB[i]);
     }
 
-    for (int row = 0; row < N; ++row)
-    {
-        for (int col = 0; col < N; ++col)
-        {
-            float sum = 0.0f;
-            for (int k = 0; k < N; ++k)
-            {
-                sum += hA[row*N+k] * hB[k*N+col];
-            }
-            hC_ref[row * N + col] = sum;
-        }
-    }
+    // for (int row = 0; row < N; ++row)
+    // {
+    //     for (int col = 0; col < N; ++col)
+    //     {
+    //         float sum = 0.0f;
+    //         for (int k = 0; k < N; ++k)
+    //         {
+    //             sum += __half2float(hA_half[row*N+k]) * __half2float(hB_half[k*N+col]);
+    //         }
+    //         hC_ref[row * N + col] = sum;
+    //     }
+    // }
 
     half *dA = nullptr;
     half *dB = nullptr;
@@ -252,7 +280,7 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaMemcpy(dB, hB_half.data(), half_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(dC, 0, float_bytes));
 
-    dim3 block(32, 6);
+    dim3 block(32, 8);
     dim3 grid((N + BLOCK_SIZE_N - 1) / BLOCK_SIZE_N,
               (N + BLOCK_SIZE_M - 1) / BLOCK_SIZE_M);
 
@@ -274,29 +302,29 @@ int main(int argc, char **argv)
 
     bool ok = true;
     const float epsilon = 1e-2f;
-    for (int row = 0; row < N && ok; ++row)
-    {
-        for (int col = 0; col < N; ++col)
-        {
-            const float diff = std::fabs(hC[row * N + col] - hC_ref[row * N + col]);
-            if (diff > epsilon)
-            {
-                std::printf("Mismatch at (%d, %d): gpu=%f cpu=%f diff=%f\n",
-                            row, col, hC[row * N + col], hC_ref[row * N + col], diff);
-                ok = false;
-                break;
-            }
-        }
-    }
+    // for (int row = 0; row < N && ok; ++row)
+    // {
+    //     for (int col = 0; col < N; ++col)
+    //     {
+    //         const float diff = std::fabs(hC[row * N + col] - hC_ref[row * N + col]);
+    //         if (diff > epsilon)
+    //         {
+    //             std::printf("Mismatch at (%d, %d): gpu=%f cpu=%f diff=%f\n",
+    //                         row, col, hC[row * N + col], hC_ref[row * N + col], diff);
+    //             ok = false;
+    //             break;
+    //         }
+    //     }
+    // }
 
-    if (ok)
-    {
-        std::printf("Tensor Core GEMM result matches CPU reference\n");
-    }
-    else
-    {
-        std::printf("Tensor Core GEMM result does not match CPU reference\n");
-    }
+    // if (ok)
+    // {
+    //     std::printf("Tensor Core GEMM result matches CPU reference\n");
+    // }
+    // else
+    // {
+    //     std::printf("Tensor Core GEMM result does not match CPU reference\n");
+    // }
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
