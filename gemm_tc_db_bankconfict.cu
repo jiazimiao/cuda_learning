@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda/pipeline>
 #include <cuda_fp16.h>
+#include <cooperative_groups.h>
 #include <mma.h>
 
 #include <cstdio>
@@ -8,6 +9,9 @@
 #include <ctime>
 #include <vector>
 #include <cmath>
+
+
+namespace cg = cooperative_groups;
 // tensor core v3：使用简单的sharedmemory搬运数据+wmma（load+mma+store）实现矩阵乘法
 // 但是这次是4个warp合作处理一个blocktile，使用更多的sharedmemory来减少global memory访问次数
 // 双缓冲
@@ -15,16 +19,16 @@
 using namespace nvcuda::wmma;
 
 // BLOCK大小决定多少个线程合作处理这件事，以32各位一组（warp）
-// blocktile的大小根据需要几个warp决定
-constexpr int BLOCK_SIZE_M = 64;
-constexpr int BLOCK_SIZE_N = 64;
-constexpr int BLOCK_SIZE_K = 16;
+// blocktile的大小根据/sharedmemory的块大小
+constexpr int BLOCK_SIZE_M = 128;
+constexpr int BLOCK_SIZE_N = 128;
+constexpr int BLOCK_SIZE_K = 32;
 
-// TILE_SIZE决定进sharedmemory的块大小
+// TILE_SIZE决定进sharedmemory的块大小/需要几个warp决定,寄存器等资源的多少？
 constexpr int TILE_M = 32;
-constexpr int TILE_N = 16;
+constexpr int TILE_N = 32;
 // constexpr int TILE_K = 32;
-
+constexpr int WARP_NUM = (BLOCK_SIZE_M / TILE_M) * (BLOCK_SIZE_N / TILE_N);
 // WMMA_SIZE决定fragment的大小，需要和tensorcore处理能力对齐
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
@@ -66,11 +70,16 @@ __global__ void gemm_tensorcore(
     const int block_n =
         blockIdx.x * BLOCK_SIZE_N;
 
-    __shared__ half sA[2][BLOCK_SIZE_M][BLOCK_SIZE_K];
-    __shared__ half sB[2][BLOCK_SIZE_K][BLOCK_SIZE_N];
-    __shared__ float sC[BLOCK_SIZE_M][BLOCK_SIZE_N];
+    const int SKEW_HALF = 8;    
+    constexpr int PIPELINE_STAGES = 2;
 
-    auto pipeline = cuda::make_pipeline();
+    __shared__ half sA[2][BLOCK_SIZE_M][BLOCK_SIZE_K+SKEW_HALF];
+    __shared__ half sB[2][BLOCK_SIZE_K][BLOCK_SIZE_N+SKEW_HALF];
+   // __shared__ float sC[BLOCK_SIZE_M][BLOCK_SIZE_N];
+
+    __shared__ cuda::pipeline_shared_state<cuda::thread_scope_block,PIPELINE_STAGES> pipe_state;
+     const cg::thread_block block = cg::this_thread_block();
+    auto pipe = cuda::make_pipeline(block, &pipe_state);
 
     fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, half, row_major> a_frag[TILE_M / WMMA_M];
     fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, half, row_major> b_frag[TILE_N / WMMA_N];
@@ -85,6 +94,7 @@ __global__ void gemm_tensorcore(
     }
 
     // global M ->shared M
+    pipe.producer_acquire();
     int buffer = 0;
     for (int idx = tid; idx < BLOCK_SIZE_M * BLOCK_SIZE_K; idx += num_thread)
     {
@@ -94,7 +104,7 @@ __global__ void gemm_tensorcore(
         const int g_col = c;
         if (g_row < N && g_col < N)
         {
-            cuda::memcpy_async(&sA[buffer][r][c], &A[g_row * N + g_col], sizeof(half), pipeline);
+            cuda::memcpy_async(&sA[buffer][r][c], &A[g_row * N + g_col], sizeof(half), pipe);
         }
         else
         {
@@ -111,7 +121,7 @@ __global__ void gemm_tensorcore(
 
         if (g_row < N && g_col < N)
         {
-            cuda::memcpy_async(&sB[buffer][r][c], &B[g_row * N + g_col], sizeof(half), pipeline);
+            cuda::memcpy_async(&sB[buffer][r][c], &B[g_row * N + g_col], sizeof(half), pipe);
         }
         else
         {
@@ -119,11 +129,8 @@ __global__ void gemm_tensorcore(
         }
     }
 
-    pipeline.producer_commit();
+    pipe.producer_commit();
 
-    pipeline.consumer_wait();
-
-    __syncthreads();
 
 #pragma unroll
     for (int tile_k = 0; tile_k < N; tile_k += BLOCK_SIZE_K)
@@ -131,6 +138,7 @@ __global__ void gemm_tensorcore(
         int next = buffer ^ 1;
         if (tile_k + BLOCK_SIZE_K < N)
         {
+             pipe.producer_acquire();
             for (int idx = tid; idx < BLOCK_SIZE_M * BLOCK_SIZE_K; idx += num_thread)
             {
                 const int r = idx / BLOCK_SIZE_K;
@@ -139,7 +147,7 @@ __global__ void gemm_tensorcore(
                 const int g_col = tile_k + c + BLOCK_SIZE_K;
                 if (g_row < N && g_col < N)
                 {
-                    cuda::memcpy_async(&sA[next][r][c], &A[g_row * N + g_col], sizeof(half), pipeline);
+                    cuda::memcpy_async(&sA[next][r][c], &A[g_row * N + g_col], sizeof(half), pipe);
                 }
                 else
                 {
@@ -155,26 +163,28 @@ __global__ void gemm_tensorcore(
                 const int g_col = block_n + c;
                 if (g_row < N && g_col < N)
                 {
-                    cuda::memcpy_async(&sB[next][r][c], &B[g_row * N + g_col], sizeof(half), pipeline);
+                    cuda::memcpy_async(&sB[next][r][c], &B[g_row * N + g_col], sizeof(half), pipe);
                 }
                 else
                 {
                     sB[next][r][c] = __float2half(0.0f);
                 }
             }
-            pipeline.producer_commit();
+            pipe.producer_commit();
         }
 
+        pipe.consumer_wait();
+         __syncthreads();
         // shared M -> register(fragment,方便后续tensorcore使用)
         for (int k = 0; k < BLOCK_SIZE_K; k += WMMA_K)
         {
             for (int i = 0; i < TILE_M / WMMA_M; i++)
             {
-                load_matrix_sync(a_frag[i], &sA[buffer][warp_m * TILE_M + i * WMMA_M][k], BLOCK_SIZE_K);
+                load_matrix_sync(a_frag[i], &sA[buffer][warp_m * TILE_M + i * WMMA_M][k], BLOCK_SIZE_K+SKEW_HALF);
             }
             for (int i = 0; i < TILE_N / WMMA_N; i++)
             {
-                load_matrix_sync(b_frag[i], &sB[buffer][k][warp_n * TILE_N + i * WMMA_N], BLOCK_SIZE_N);
+                load_matrix_sync(b_frag[i], &sB[buffer][k][warp_n * TILE_N + i * WMMA_N], BLOCK_SIZE_N+SKEW_HALF);
             }
 
             for (int i = 0; i < TILE_M / WMMA_M; i++)
@@ -185,13 +195,13 @@ __global__ void gemm_tensorcore(
                 }
             }
         }
-
-        pipeline.consumer_release();
+         __syncthreads();
+        pipe.consumer_release();
+    
         if (tile_k + BLOCK_SIZE_K < N)
         {
 
-            pipeline.consumer_wait();
-
+            pipe.consumer_wait();
             __syncthreads();
 
             buffer = next;
@@ -302,7 +312,7 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaMemcpy(dB, hB_half.data(), half_bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(dC, 0, float_bytes));
 
-    dim3 block(32, 4);
+    dim3 block(32,WARP_NUM);
     dim3 grid((N + BLOCK_SIZE_N - 1) / BLOCK_SIZE_N,
               (N + BLOCK_SIZE_M - 1) / BLOCK_SIZE_M);
 
