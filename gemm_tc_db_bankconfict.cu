@@ -174,7 +174,7 @@ __global__ void gemm_tensorcore(
         }
 
         pipe.consumer_wait();
-         __syncthreads();
+        // __syncthreads();
         // shared M -> register(fragment,方便后续tensorcore使用)
         for (int k = 0; k < BLOCK_SIZE_K; k += WMMA_K)
         {
@@ -195,14 +195,13 @@ __global__ void gemm_tensorcore(
                 }
             }
         }
-         __syncthreads();
+         // __syncthreads();
         pipe.consumer_release();
     
         if (tile_k + BLOCK_SIZE_K < N)
         {
-
-            pipe.consumer_wait();
-            __syncthreads();
+            // pipe.consumer_wait();
+            // __syncthreads();
 
             buffer = next;
         }
