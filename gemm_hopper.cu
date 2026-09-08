@@ -15,7 +15,7 @@ namespace cg = cooperative_groups;
 // 但是这次是4个warp合作处理一个blocktile，使用更多的sharedmemory来减少global memory访问次数
 // 双缓冲
 // 新增：将memcpy_async搬运变成每线程搬运8个half，这样所有线程可以在一次操作中完成对AB的搬运
-//在上面的基础上适配hopper的大小
+// 在上面的基础上适配hopper的大小
 
 using namespace nvcuda::wmma;
 
@@ -26,14 +26,17 @@ constexpr int BLOCK_SIZE_N = 256;
 constexpr int BLOCK_SIZE_K = 32;
 
 // TILE_SIZE决定进sharedmemory的块大小/需要几个warp决定,寄存器等资源的多少？
-constexpr int TILE_M = 32;
-constexpr int TILE_N = 32;
+constexpr int TILE_M = 64;
+constexpr int TILE_N = 64;
 // constexpr int TILE_K = 32;
 constexpr int WARP_NUM = (BLOCK_SIZE_M / TILE_M) * (BLOCK_SIZE_N / TILE_N);
 // WMMA_SIZE决定fragment的大小，需要和tensorcore处理能力对齐
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
+
+constexpr int SKEW_HALF = 8;
+constexpr int PIPELINE_STAGES = 2;
 
 #define CUDA_CHECK(call)                                                 \
     do                                                                   \
@@ -71,12 +74,24 @@ __global__ void gemm_tensorcore(
     const int block_n =
         blockIdx.x * BLOCK_SIZE_N;
 
-    const int SKEW_HALF = 8;
-    constexpr int PIPELINE_STAGES = 2;
+   
 
-    __shared__ __align__(16) half sA[2][BLOCK_SIZE_M][BLOCK_SIZE_K + SKEW_HALF];
-    __shared__ half sB[2][BLOCK_SIZE_K][BLOCK_SIZE_N + SKEW_HALF];
-    // __shared__ float sC[BLOCK_SIZE_M][BLOCK_SIZE_N];
+    extern __shared__ __align__(16) unsigned char smem[];
+
+    half *sA_base = reinterpret_cast<half *>(smem);
+
+    half *sB_base =
+        sA_base +
+        2 * BLOCK_SIZE_M * (BLOCK_SIZE_K + SKEW_HALF);
+
+    half(*sA)[BLOCK_SIZE_M][BLOCK_SIZE_K + SKEW_HALF] =
+        reinterpret_cast<
+            half(*)[BLOCK_SIZE_M][BLOCK_SIZE_K + SKEW_HALF]>(sA_base);
+
+    half(*sB)[BLOCK_SIZE_K][BLOCK_SIZE_N + SKEW_HALF] =
+        reinterpret_cast<
+            half(*)[BLOCK_SIZE_K][BLOCK_SIZE_N + SKEW_HALF]>(sB_base);
+
     constexpr int VEC_HALF = 8;
 
     __shared__ cuda::pipeline_shared_state<cuda::thread_scope_block, PIPELINE_STAGES> pipe_state;
@@ -98,17 +113,17 @@ __global__ void gemm_tensorcore(
     // global M ->shared M
     pipe.producer_acquire();
     int buffer = 0;
-    for (int vec = tid*VEC_HALF; vec < BLOCK_SIZE_M * BLOCK_SIZE_K; vec += num_thread * VEC_HALF)
+    for (int vec = tid * VEC_HALF; vec < BLOCK_SIZE_M * BLOCK_SIZE_K; vec += num_thread * VEC_HALF)
     {
-        const int r = vec  / BLOCK_SIZE_K;
-        const int c = vec  % BLOCK_SIZE_K;
+        const int r = vec / BLOCK_SIZE_K;
+        const int c = vec % BLOCK_SIZE_K;
         const int g_row = block_m + r;
         const int g_col = c;
         // if (g_row < N && g_col + VEC_HALF <= N)
         // {
-            cuda::memcpy_async(&sA[buffer][r][c],
-                 &A[g_row * N + g_col], 
-                 cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
+        cuda::memcpy_async(&sA[buffer][r][c],
+                           &A[g_row * N + g_col],
+                           cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
         // }
         // else
         // {
@@ -134,7 +149,7 @@ __global__ void gemm_tensorcore(
     //     }
     // }
 
-    for (int idx = tid*VEC_HALF; idx < BLOCK_SIZE_K * BLOCK_SIZE_N; idx += num_thread * VEC_HALF)
+    for (int idx = tid * VEC_HALF; idx < BLOCK_SIZE_K * BLOCK_SIZE_N; idx += num_thread * VEC_HALF)
     {
         const int r = idx / BLOCK_SIZE_N;
         const int c = idx % BLOCK_SIZE_N;
@@ -143,9 +158,9 @@ __global__ void gemm_tensorcore(
 
         // if (g_row < N && g_col + VEC_HALF <= N)
         // {
-            cuda::memcpy_async(&sB[buffer][r][c], 
-                &B[g_row * N + g_col],
-                 cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
+        cuda::memcpy_async(&sB[buffer][r][c],
+                           &B[g_row * N + g_col],
+                           cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
         // }
         // else
         // {
@@ -165,7 +180,7 @@ __global__ void gemm_tensorcore(
         if (tile_k + BLOCK_SIZE_K < N)
         {
             pipe.producer_acquire();
-            for (int vec = tid*VEC_HALF; vec < BLOCK_SIZE_M * BLOCK_SIZE_K; vec += num_thread * VEC_HALF)
+            for (int vec = tid * VEC_HALF; vec < BLOCK_SIZE_M * BLOCK_SIZE_K; vec += num_thread * VEC_HALF)
             {
                 const int r = vec / BLOCK_SIZE_K;
                 const int c = vec % BLOCK_SIZE_K;
@@ -174,20 +189,20 @@ __global__ void gemm_tensorcore(
                 ;
                 // if (g_row < N && g_col + VEC_HALF <= N)
                 // {
-                    cuda::memcpy_async(&sA[next][r][c], 
-                        &A[g_row * N + g_col], 
-                        cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
+                cuda::memcpy_async(&sA[next][r][c],
+                                   &A[g_row * N + g_col],
+                                   cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
                 // }
                 // else
                 // {
-                    // for (int i = 0; i < VEC_HALF; i++)
-                    // {
-                    //     sA[next][r][c + i] = (g_row < N && g_col + i < N) ? A[g_row * N + g_col + i] : __float2half(0.0f);
-                    // }
+                // for (int i = 0; i < VEC_HALF; i++)
+                // {
+                //     sA[next][r][c + i] = (g_row < N && g_col + i < N) ? A[g_row * N + g_col + i] : __float2half(0.0f);
+                // }
                 // }
             }
 
-            for (int idx = tid*VEC_HALF; idx < BLOCK_SIZE_K * BLOCK_SIZE_N; idx += num_thread * VEC_HALF)
+            for (int idx = tid * VEC_HALF; idx < BLOCK_SIZE_K * BLOCK_SIZE_N; idx += num_thread * VEC_HALF)
             {
                 const int r = idx / BLOCK_SIZE_N;
                 const int c = idx % BLOCK_SIZE_N;
@@ -196,9 +211,9 @@ __global__ void gemm_tensorcore(
 
                 // if (g_row < N && g_col + VEC_HALF <= N)
                 // {
-                    cuda::memcpy_async(&sB[next][r][c], 
-                        &B[g_row * N + g_col],
-                         cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
+                cuda::memcpy_async(&sB[next][r][c],
+                                   &B[g_row * N + g_col],
+                                   cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
                 // }
                 // else
                 // {
@@ -331,7 +346,7 @@ int main(int argc, char **argv)
             float sum = 0.0f;
             for (int k = 0; k < N; ++k)
             {
-                sum += __half2float(hA_half[row*N+k]) * __half2float(hB_half[k*N+col]);
+                sum += __half2float(hA_half[row * N + k]) * __half2float(hB_half[k * N + col]);
             }
             hC_ref[row * N + col] = sum;
         }
@@ -354,11 +369,23 @@ int main(int argc, char **argv)
               (N + BLOCK_SIZE_M - 1) / BLOCK_SIZE_M);
 
     cudaEvent_t start, stop;
+
+    constexpr size_t SMEM_AB =
+    2 * BLOCK_SIZE_M * (BLOCK_SIZE_K + SKEW_HALF) * sizeof(half) +
+    2 * BLOCK_SIZE_K * (BLOCK_SIZE_N + SKEW_HALF) * sizeof(half);
+
+    size_t smem_size = SMEM_AB + 256;
+    cudaFuncSetAttribute(
+    gemm_tensorcore,
+    cudaFuncAttributeMaxDynamicSharedMemorySize,
+    smem_size
+);
+
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
     CUDA_CHECK(cudaEventRecord(start));
-    gemm_tensorcore<<<grid, block>>>(dA, dB, dC, N);
+    gemm_tensorcore<<<grid, block, smem_size>>>(dA, dB, dC, N);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
