@@ -23,11 +23,11 @@ using namespace nvcuda::wmma;
 // blocktile的大小根据/sharedmemory的块大小
 constexpr int BLOCK_SIZE_M = 128;
 constexpr int BLOCK_SIZE_N = 256;
-constexpr int BLOCK_SIZE_K = 32;
+constexpr int BLOCK_SIZE_K = 128;
 
 // TILE_SIZE决定进sharedmemory的块大小/需要几个warp决定,寄存器等资源的多少？
 constexpr int TILE_M = 32;
-constexpr int TILE_N = 64;
+constexpr int TILE_N = 32;
 // constexpr int TILE_K = 32;
 constexpr int WARP_NUM = (BLOCK_SIZE_M / TILE_M) * (BLOCK_SIZE_N / TILE_N);
 // WMMA_SIZE决定fragment的大小，需要和tensorcore处理能力对齐
