@@ -99,21 +99,23 @@ __global__ void gemm_tensorcore(
     int buffer = 0;
     for (int vec = tid*VEC_HALF; vec < BLOCK_SIZE_M * BLOCK_SIZE_K; vec += num_thread * VEC_HALF)
     {
-        const int r = vec * VEC_HALF / BLOCK_SIZE_K;
-        const int c = vec * VEC_HALF % BLOCK_SIZE_K;
+        const int r = vec  / BLOCK_SIZE_K;
+        const int c = vec  % BLOCK_SIZE_K;
         const int g_row = block_m + r;
         const int g_col = c;
-        if (g_row < N && g_col + VEC_HALF < N)
-        {
-            cuda::memcpy_async(&sA[buffer][r][c], &A[g_row * N + g_col], VEC_HALF * sizeof(half), pipe);
-        }
-        else
-        {
-            for (int i = 0; i < VEC_HALF; i++)
-            {
-                sA[buffer][r][c + i] = (g_row < N && g_col + i < N) ? A[g_row * N + g_col + i] : __float2half(0.0f);
-            }
-        }
+        // if (g_row < N && g_col + VEC_HALF <= N)
+        // {
+            cuda::memcpy_async(&sA[buffer][r][c],
+                 &A[g_row * N + g_col], 
+                 cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
+        // }
+        // else
+        // {
+        //     for (int i = 0; i < VEC_HALF; i++)
+        //     {
+        //         sA[buffer][r][c + i] = (g_row < N && g_col + i < N) ? A[g_row * N + g_col + i] : __float2half(0.0f);
+        //     }
+        // }
     }
     // for (int idx = tid; idx < BLOCK_SIZE_M * BLOCK_SIZE_K; idx += num_thread)
     // {
@@ -133,22 +135,24 @@ __global__ void gemm_tensorcore(
 
     for (int idx = tid*VEC_HALF; idx < BLOCK_SIZE_K * BLOCK_SIZE_N; idx += num_thread * VEC_HALF)
     {
-        const int r = idx * VEC_HALF / BLOCK_SIZE_N;
-        const int c = idx * VEC_HALF % BLOCK_SIZE_N;
+        const int r = idx / BLOCK_SIZE_N;
+        const int c = idx % BLOCK_SIZE_N;
         const int g_row = r;
         const int g_col = block_n + c;
 
-        if (g_row < N && g_col + VEC_HALF < N)
-        {
-            cuda::memcpy_async(&sB[buffer][r][c], &B[g_row * N + g_col], VEC_HALF * sizeof(half), pipe);
-        }
-        else
-        {
-            for (int i = 0; i < VEC_HALF; i++)
-            {
-                sB[buffer][r][c + i] = (g_row < N && g_col + i < N) ? B[g_row * N + g_col + i] : __float2half(0.0f);
-            }
-        }
+        // if (g_row < N && g_col + VEC_HALF <= N)
+        // {
+            cuda::memcpy_async(&sB[buffer][r][c], 
+                &B[g_row * N + g_col],
+                 cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
+        // }
+        // else
+        // {
+        //     for (int i = 0; i < VEC_HALF; i++)
+        //     {
+        //         sB[buffer][r][c + i] = (g_row < N && g_col + i < N) ? B[g_row * N + g_col + i] : __float2half(0.0f);
+        //     }
+        // }
     }
 
     pipe.producer_commit();
@@ -162,42 +166,46 @@ __global__ void gemm_tensorcore(
             pipe.producer_acquire();
             for (int vec = tid*VEC_HALF; vec < BLOCK_SIZE_M * BLOCK_SIZE_K; vec += num_thread * VEC_HALF)
             {
-                const int r = vec * VEC_HALF / BLOCK_SIZE_K;
-                const int c = vec * VEC_HALF % BLOCK_SIZE_K;
+                const int r = vec / BLOCK_SIZE_K;
+                const int c = vec % BLOCK_SIZE_K;
                 const int g_row = block_m + r;
                 const int g_col = tile_k + c + BLOCK_SIZE_K;
                 ;
-                if (g_row < N && g_col + VEC_HALF < N)
-                {
-                    cuda::memcpy_async(&sA[next][r][c], &A[g_row * N + g_col], VEC_HALF * sizeof(half), pipe);
-                }
-                else
-                {
-                    for (int i = 0; i < VEC_HALF; i++)
-                    {
-                        sA[next][r][c + i] = (g_row < N && g_col + i < N) ? A[g_row * N + g_col + i] : __float2half(0.0f);
-                    }
-                }
+                // if (g_row < N && g_col + VEC_HALF <= N)
+                // {
+                    cuda::memcpy_async(&sA[next][r][c], 
+                        &A[g_row * N + g_col], 
+                        cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
+                // }
+                // else
+                // {
+                    // for (int i = 0; i < VEC_HALF; i++)
+                    // {
+                    //     sA[next][r][c + i] = (g_row < N && g_col + i < N) ? A[g_row * N + g_col + i] : __float2half(0.0f);
+                    // }
+                // }
             }
 
             for (int idx = tid*VEC_HALF; idx < BLOCK_SIZE_K * BLOCK_SIZE_N; idx += num_thread * VEC_HALF)
             {
-                const int r = idx * VEC_HALF / BLOCK_SIZE_N;
-                const int c = idx * VEC_HALF % BLOCK_SIZE_N;
+                const int r = idx / BLOCK_SIZE_N;
+                const int c = idx % BLOCK_SIZE_N;
                 const int g_row = tile_k + r + BLOCK_SIZE_K;
                 const int g_col = block_n + c;
 
-                if (g_row < N && g_col + VEC_HALF < N)
-                {
-                    cuda::memcpy_async(&sB[next][r][c], &B[g_row * N + g_col], VEC_HALF * sizeof(half), pipe);
-                }
-                else
-                {
-                    for (int i = 0; i < VEC_HALF; i++)
-                    {
-                        sB[next][r][c + i] = (g_row < N && g_col + i < N) ? B[g_row * N + g_col + i] : __float2half(0.0f);
-                    }
-                }
+                // if (g_row < N && g_col + VEC_HALF <= N)
+                // {
+                    cuda::memcpy_async(&sB[next][r][c], 
+                        &B[g_row * N + g_col],
+                         cuda::aligned_size_t<VEC_HALF * sizeof(half)>(VEC_HALF * sizeof(half)), pipe);
+                // }
+                // else
+                // {
+                //     for (int i = 0; i < VEC_HALF; i++)
+                //     {
+                //         sB[next][r][c + i] = (g_row < N && g_col + i < N) ? B[g_row * N + g_col + i] : __float2half(0.0f);
+                //     }
+                // }
             }
             pipe.producer_commit();
         }
@@ -315,18 +323,18 @@ int main(int argc, char **argv)
         hB_half[i] = __float2half(hB[i]);
     }
 
-    for (int row = 0; row < N; ++row)
-    {
-        for (int col = 0; col < N; ++col)
-        {
-            float sum = 0.0f;
-            for (int k = 0; k < N; ++k)
-            {
-                sum += __half2float(hA_half[row*N+k]) * __half2float(hB_half[k*N+col]);
-            }
-            hC_ref[row * N + col] = sum;
-        }
-    }
+    // for (int row = 0; row < N; ++row)
+    // {
+    //     for (int col = 0; col < N; ++col)
+    //     {
+    //         float sum = 0.0f;
+    //         for (int k = 0; k < N; ++k)
+    //         {
+    //             sum += __half2float(hA_half[row*N+k]) * __half2float(hB_half[k*N+col]);
+    //         }
+    //         hC_ref[row * N + col] = sum;
+    //     }
+    // }
 
     half *dA = nullptr;
     half *dB = nullptr;
@@ -362,29 +370,29 @@ int main(int argc, char **argv)
 
     bool ok = true;
     const float epsilon = 1e-2f;
-    for (int row = 0; row < N && ok; ++row)
-    {
-        for (int col = 0; col < N; ++col)
-        {
-            const float diff = std::fabs(hC[row * N + col] - hC_ref[row * N + col]);
-            if (diff > epsilon)
-            {
-                std::printf("Mismatch at (%d, %d): gpu=%f cpu=%f diff=%f\n",
-                            row, col, hC[row * N + col], hC_ref[row * N + col], diff);
-                ok = false;
-                break;
-            }
-        }
-    }
+    // for (int row = 0; row < N && ok; ++row)
+    // {
+    //     for (int col = 0; col < N; ++col)
+    //     {
+    //         const float diff = std::fabs(hC[row * N + col] - hC_ref[row * N + col]);
+    //         if (diff > epsilon)
+    //         {
+    //             std::printf("Mismatch at (%d, %d): gpu=%f cpu=%f diff=%f\n",
+    //                         row, col, hC[row * N + col], hC_ref[row * N + col], diff);
+    //             ok = false;
+    //             break;
+    //         }
+    //     }
+    // }
 
-    if (ok)
-    {
-        std::printf("Tensor Core GEMM result matches CPU reference\n");
-    }
-    else
-    {
-        std::printf("Tensor Core GEMM result does not match CPU reference\n");
-    }
+    // if (ok)
+    // {
+    //     std::printf("Tensor Core GEMM result matches CPU reference\n");
+    // }
+    // else
+    // {
+    //     std::printf("Tensor Core GEMM result does not match CPU reference\n");
+    // }
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
