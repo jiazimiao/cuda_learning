@@ -21,7 +21,7 @@ using namespace nvcuda::wmma;
 
 // BLOCK大小决定多少个线程合作处理这件事，以32各位一组（warp）
 // blocktile的大小根据/sharedmemory的块大小
-constexpr int BLOCK_SIZE_M = 256;
+constexpr int BLOCK_SIZE_M = 128;
 constexpr int BLOCK_SIZE_N = 256;
 constexpr int BLOCK_SIZE_K = 32;
 
