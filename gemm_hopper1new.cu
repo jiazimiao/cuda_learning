@@ -24,6 +24,10 @@ constexpr int WN = 64;
 constexpr int WK = 16;
 constexpr int WARP_GROUP_THREADS = 128;
 
+#ifndef WGMMA_USE_32B_SWIZZLE
+#define WGMMA_USE_32B_SWIZZLE 1
+#endif
+
 #define CUDA_CHECK(call)                                                        \
   do {                                                                          \
     cudaError_t status_ = (call);                                               \
@@ -36,16 +40,28 @@ constexpr int WARP_GROUP_THREADS = 128;
 
 // WGMMA's descriptor stores these three quantities as (bytes >> 4):
 // [13:0] start address, [29:16] leading (K) core offset,
-// [45:32] stride (M/N) core offset.  This learning version uses layout type 0
-// (no swizzle): every 8x8 core matrix occupies one contiguous 128-byte region.
+// [45:32] stride (M/N) core offset.
 __device__ __forceinline__ uint64_t make_wgmma_desc(const void* smem,
                                                      uint32_t leading_bytes,
                                                      uint32_t stride_bytes) {
   const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-  return (static_cast<uint64_t>((address       & 0x3ffffu) >> 4)      ) |
-         (static_cast<uint64_t>((leading_bytes & 0x3ffffu) >> 4) << 16) |
-         (static_cast<uint64_t>((stride_bytes  & 0x3ffffu) >> 4) << 32);
+  uint64_t desc = (static_cast<uint64_t>((address       & 0x3ffffu) >> 4)      ) |
+                  (static_cast<uint64_t>((leading_bytes & 0x3ffffu) >> 4) << 16) |
+                  (static_cast<uint64_t>((stride_bytes  & 0x3ffffu) >> 4) << 32);
+#if WGMMA_USE_32B_SWIZZLE
+  // ===== BEGIN 32B-SWIZZLE DIFFERENCE: descriptor layout type =====
+  desc |= 3ull << 62;  // SM90 WGMMA B32 swizzle
+  // ===== END 32B-SWIZZLE DIFFERENCE =====
+#endif
+  return desc;
 }
+
+// ===== BEGIN 32B-SWIZZLE DIFFERENCE: logical -> physical shared address =====
+// B32 (Swizzle<1,4,3>), in half-element units, for a 256B-aligned tile base.
+__device__ __forceinline__ int swizzle_32b_half_index(int logical_index) {
+  return logical_index ^ ((logical_index & 0x40) >> 4);
+}
+// ===== END 32B-SWIZZLE DIFFERENCE =====
 
 // No-swizzle WGMMA storage is not a normal flat row/column-major array: it is
 // a contiguous sequence of 8x8 cores. A cores are row-major; B cores are
@@ -107,9 +123,16 @@ void wgmma_gemm_4096(const half* __restrict__ A,
                      const half* __restrict__ B,
                      float* __restrict__ C) {
   // Logical A is row-major [64][16] and logical B is column-major [16][64].
-  // Their physical shared-memory storage is the no-swizzle 8x8-core layout.
+#if WGMMA_USE_32B_SWIZZLE
+  // ===== BEGIN 32B-SWIZZLE DIFFERENCE: 256B base alignment =====
+  __shared__ __align__(256) half sA[WM * WK];
+  __shared__ __align__(256) half sB[WN * WK];
+  // ===== END 32B-SWIZZLE DIFFERENCE =====
+#else
+  // Physical shared-memory storage is the no-swizzle 8x8-core layout.
   __shared__ __align__(16) half sA[WM * WK];
   __shared__ __align__(16) half sB[WN * WK];
+#endif
 
   const int tid = threadIdx.x;
   const int block_m = blockIdx.y * WM;
@@ -126,8 +149,15 @@ void wgmma_gemm_4096(const half* __restrict__ A,
     for (int e = tid; e < WM * WK; e += WARP_GROUP_THREADS) {
       const int row = e / WK;
       const int col = e % WK;
+#if WGMMA_USE_32B_SWIZZLE
+      // ===== BEGIN 32B-SWIZZLE DIFFERENCE: swizzled shared stores =====
+      sA[swizzle_32b_half_index(e)] = A[(block_m + row) * K + k0 + col];
+      sB[swizzle_32b_half_index(e)] = B[(k0 + col) * N + block_n + row];
+      // ===== END 32B-SWIZZLE DIFFERENCE =====
+#else
       sA[noswizzle_a_index(row, col)] = A[(block_m + row) * K + k0 + col];
       sB[noswizzle_b_index(col, row)] = B[(k0 + col) * N + block_n + row];
+#endif
     }
     __syncthreads();
 
@@ -138,10 +168,17 @@ void wgmma_gemm_4096(const half* __restrict__ A,
     // fence has happened before any warp starts the warpgroup MMA.
     __syncthreads();
 
-    // An 8x8 FP16 core is 128B.  K has two core matrices, so adjacent M/N
+#if WGMMA_USE_32B_SWIZZLE
+    // ===== BEGIN 32B-SWIZZLE DIFFERENCE: leading offset is one 16B K slice =====
+    const uint64_t desc_a = make_wgmma_desc(sA, 16, 256);
+    const uint64_t desc_b = make_wgmma_desc(sB, 16, 256);
+    // ===== END 32B-SWIZZLE DIFFERENCE =====
+#else
+    // An 8x8 FP16 core is 128B. K has two core matrices, so adjacent M/N
     // cores are 2 * 128 = 256B apart.
     const uint64_t desc_a = make_wgmma_desc(sA, 128, 256);
     const uint64_t desc_b = make_wgmma_desc(sB, 128, 256);
+#endif
     wgmma_m64n64k16_f32_f16_f16(d, desc_a, desc_b);
     wgmma_commit_group();
     wgmma_wait_group_0();  // d and sA/sB are not accessed before completion.
