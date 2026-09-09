@@ -267,13 +267,21 @@ int main() {
   std::vector<float> hC(static_cast<size_t>(M) * N);
   CUDA_CHECK(cudaMemcpy(hC.data(), dC, c_bytes, cudaMemcpyDeviceToHost));
   float max_abs_error = 0.0f;
+  int mismatches_reported = 0;
   // The inputs are binary-exact multiples of 1/8, so these FP32 sums are exact
   // at this size.  Check a spread of output elements without an O(N^3) host GEMM.
   for (int sample = 0; sample < 256; ++sample) {
     const int i = (sample * 997) & (M - 1);
     const int j = (sample * 619) & (N - 1);
-    max_abs_error = std::max(max_abs_error,
-        std::abs(hC[static_cast<size_t>(i) * N + j] - reference_element(i, j)));
+    const float expected = reference_element(i, j);
+    const float actual = hC[static_cast<size_t>(i) * N + j];
+    const float abs_error = std::abs(actual - expected);
+    max_abs_error = std::max(max_abs_error, abs_error);
+    if (abs_error != 0.0f && mismatches_reported < 8) {
+      std::printf("  mismatch C[%d,%d]: GPU=%g CPU=%g abs_err=%g\\n",
+                  i, j, actual, expected, abs_error);
+      ++mismatches_reported;
+    }
   }
   const double tflops = (2.0 * M * N * K) / (static_cast<double>(milliseconds) * 1.0e9);
   std::printf("WGMMA m64n64k16 FP16xFP16->FP32, M=N=K=4096\n");
