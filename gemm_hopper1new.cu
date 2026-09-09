@@ -58,9 +58,16 @@ __device__ __forceinline__ uint64_t make_wgmma_desc(const void* smem,
 }
 
 // ===== BEGIN 32B-SWIZZLE DIFFERENCE: logical -> physical shared address =====
-// B32 (Swizzle<1,4,3>), in half-element units, for a 256B-aligned tile base.
-__device__ __forceinline__ int swizzle_32b_half_index(int logical_index) {
-  return logical_index ^ ((logical_index & 0x40) >> 4);
+// M/N-major B32 layout for FP16 (T = 128 / 16 = 8):
+//   ((8, 2, 4), (8, 2)) : ((1, 8, 128), (16, 512))
+// before applying Swizzle<1,4,3>.  This is for a 64x16 A tile; replace m by n
+// for a 16x64 B tile.  The swizzle XORs bit 7 into bit 3 of that *canonical*
+// physical address.  Applying it to a flat row-major index is incorrect.
+__device__ __forceinline__ int swizzle_32b_half_index(int mn, int k) {
+  const int canonical = (mn & 7) + ((mn >> 3) & 1) * 8 +
+                        (mn >> 4) * 128 + (k & 7) * 16 +
+                        (k >> 3) * 512;
+  return canonical ^ ((canonical & 0x80) >> 4);
 }
 // ===== END 32B-SWIZZLE DIFFERENCE =====
 
@@ -153,8 +160,8 @@ void wgmma_gemm_4096(const half* __restrict__ A,
       const int col = e % WK;
 #if WGMMA_USE_32B_SWIZZLE
       // ===== BEGIN 32B-SWIZZLE DIFFERENCE: swizzled shared stores =====
-      sA[swizzle_32b_half_index(e)] = A[(block_m + row) * K + k0 + col];
-      sB[swizzle_32b_half_index(e)] = B[(k0 + col) * N + block_n + row];
+      sA[swizzle_32b_half_index(row, col)] = A[(block_m + row) * K + k0 + col];
+      sB[swizzle_32b_half_index(row, col)] = B[(k0 + col) * N + block_n + row];
       // ===== END 32B-SWIZZLE DIFFERENCE =====
 #else
       sA[noswizzle_a_index(row, col)] = A[(block_m + row) * K + k0 + col];
@@ -171,9 +178,12 @@ void wgmma_gemm_4096(const half* __restrict__ A,
     __syncthreads();
 
 #if WGMMA_USE_32B_SWIZZLE
-    // ===== BEGIN 32B-SWIZZLE DIFFERENCE: leading offset is one 16B K slice =====
-    const uint64_t desc_a = make_wgmma_desc(sA, 16, 256);
-    const uint64_t desc_b = make_wgmma_desc(sB, 16, 256);
+    // ===== BEGIN 32B-SWIZZLE DIFFERENCE: B32 layout descriptor =====
+    // M/N-major B32: LBO is 128 FP16 values = 256B, and SBO is 512 FP16
+    // values = 1024B.  (The LBO-is-ignored rule applies only to K-major
+    // swizzled layouts, which this kernel deliberately does not use.)
+    const uint64_t desc_a = make_wgmma_desc(sA, 256, 1024);
+    const uint64_t desc_b = make_wgmma_desc(sB, 256, 1024);
     // ===== END 32B-SWIZZLE DIFFERENCE =====
 #else
     // An 8x8 FP16 core is 128B. K has two core matrices, so adjacent M/N
