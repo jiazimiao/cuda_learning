@@ -36,8 +36,8 @@ constexpr int WARP_GROUP_THREADS = 128;
 
 // WGMMA's descriptor stores these three quantities as (bytes >> 4):
 // [13:0] start address, [29:16] leading (K) core offset,
-// [45:32] stride (M/N) core offset.  The upper two bits select swizzle; zero
-// means the plain, unswizzled layouts used below.
+// [45:32] stride (M/N) core offset.  This learning version uses layout type 0
+// (no swizzle): every 8x8 core matrix occupies one contiguous 128-byte region.
 __device__ __forceinline__ uint64_t make_wgmma_desc(const void* smem,
                                                      uint32_t leading_bytes,
                                                      uint32_t stride_bytes) {
@@ -45,6 +45,17 @@ __device__ __forceinline__ uint64_t make_wgmma_desc(const void* smem,
   return (static_cast<uint64_t>((address       & 0x3ffffu) >> 4)      ) |
          (static_cast<uint64_t>((leading_bytes & 0x3ffffu) >> 4) << 16) |
          (static_cast<uint64_t>((stride_bytes  & 0x3ffffu) >> 4) << 32);
+}
+
+// No-swizzle WGMMA storage is not a normal flat row/column-major array: it is
+// a contiguous sequence of 8x8 cores. A cores are row-major; B cores are
+// column-major.  Core order is K-major, then M (for A) or N (for B).
+__device__ __forceinline__ int noswizzle_a_index(int m, int k) {
+  return ((m >> 3) * 2 + (k >> 3)) * 64 + (m & 7) * 8 + (k & 7);
+}
+
+__device__ __forceinline__ int noswizzle_b_index(int k, int n) {
+  return ((n >> 3) * 2 + (k >> 3)) * 64 + (n & 7) * 8 + (k & 7);
 }
 
 __device__ __forceinline__ void fence_proxy_async_shared_cta() {
@@ -95,8 +106,8 @@ __global__ __launch_bounds__(WARP_GROUP_THREADS)
 void wgmma_gemm_4096(const half* __restrict__ A,
                      const half* __restrict__ B,
                      float* __restrict__ C) {
-  // A is row-major [64][16]. B is deliberately staged column-major [64][16],
-  // i.e. sB[n][k] == B[k][n], as required by WGMMA with trans-b == 0.
+  // Logical A is row-major [64][16] and logical B is column-major [16][64].
+  // Their physical shared-memory storage is the no-swizzle 8x8-core layout.
   __shared__ __align__(16) half sA[WM * WK];
   __shared__ __align__(16) half sB[WN * WK];
 
@@ -115,9 +126,8 @@ void wgmma_gemm_4096(const half* __restrict__ A,
     for (int e = tid; e < WM * WK; e += WARP_GROUP_THREADS) {
       const int row = e / WK;
       const int col = e % WK;
-      sA[e] = A[(block_m + row) * K + k0 + col];
-      // Physical column-major layout for WGMMA's logical B[K][N].
-      sB[e] = B[(k0 + col) * N + block_n + row];
+      sA[noswizzle_a_index(row, col)] = A[(block_m + row) * K + k0 + col];
+      sB[noswizzle_b_index(col, row)] = B[(k0 + col) * N + block_n + row];
     }
     __syncthreads();
 
@@ -128,10 +138,10 @@ void wgmma_gemm_4096(const half* __restrict__ A,
     // fence has happened before any warp starts the warpgroup MMA.
     __syncthreads();
 
-    // For both matrices, adjacent K core matrices are 16 bytes apart and
-    // adjacent M/N core matrices are 8 * 16 * sizeof(half) = 256 bytes apart.
-    const uint64_t desc_a = make_wgmma_desc(sA, 16, 256);
-    const uint64_t desc_b = make_wgmma_desc(sB, 16, 256);
+    // An 8x8 FP16 core is 128B.  K has two core matrices, so adjacent M/N
+    // cores are 2 * 128 = 256B apart.
+    const uint64_t desc_a = make_wgmma_desc(sA, 128, 256);
+    const uint64_t desc_b = make_wgmma_desc(sB, 128, 256);
     wgmma_m64n64k16_f32_f16_f16(d, desc_a, desc_b);
     wgmma_commit_group();
     wgmma_wait_group_0();  // d and sA/sB are not accessed before completion.
