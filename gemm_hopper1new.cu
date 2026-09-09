@@ -26,7 +26,7 @@ constexpr int WK = 16;
 constexpr int WARP_GROUP_THREADS = 128;
 
 #ifndef WGMMA_USE_32B_SWIZZLE
-#define WGMMA_USE_32B_SWIZZLE 1
+#define WGMMA_USE_32B_SWIZZLE 0
 #endif
 
 #define CUDA_CHECK(call)                                                        \
@@ -64,15 +64,16 @@ __device__ __forceinline__ int swizzle_32b_half_index(int logical_index) {
 }
 // ===== END 32B-SWIZZLE DIFFERENCE =====
 
-// No-swizzle WGMMA storage is not a normal flat row/column-major array: it is
-// a contiguous sequence of 8x8 cores. A cores are row-major; B cores are
-// column-major.  Core order is K-major, then M (for A) or N (for B).
+// No-swizzle M/N-major WGMMA storage is not a normal flat row-major array.
+// It is a sequence of 8x8 cores, and every core is stored transposed. This
+// matches imm-trans-a=1 / imm-trans-b=1 while global A[M,K] and B[K,N] stay
+// row-major. Core order is K-major, then M (for A) or N (for B).
 __device__ __forceinline__ int noswizzle_a_index(int m, int k) {
-  return ((m >> 3) * 2 + (k >> 3)) * 64 + (m & 7) * 8 + (k & 7);
+  return ((m >> 3) * 2 + (k >> 3)) * 64 + (k & 7) * 8 + (m & 7);
 }
 
 __device__ __forceinline__ int noswizzle_b_index(int k, int n) {
-  return ((n >> 3) * 2 + (k >> 3)) * 64 + (n & 7) * 8 + (k & 7);
+  return ((n >> 3) * 2 + (k >> 3)) * 64 + (k & 7) * 8 + (n & 7);
 }
 
 __device__ __forceinline__ void fence_proxy_async_shared_cta() {
@@ -105,7 +106,7 @@ __device__ __forceinline__ void wgmma_m64n64k16_f32_f16_f16(
       " %8, %9, %10, %11, %12, %13, %14, %15, "
       " %16, %17, %18, %19, %20, %21, %22, %23, "
       " %24, %25, %26, %27, %28, %29, %30, %31}, "
-      "%32, %33, p, 1, 1, 0, 0;\n"
+      "%32, %33, p, 1, 1, 1, 1;\n"
       "}\n"
       : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]),
         "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]),
