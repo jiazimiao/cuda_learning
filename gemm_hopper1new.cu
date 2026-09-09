@@ -60,16 +60,17 @@ __device__ __forceinline__ uint64_t make_wgmma_desc(const void* smem,
 // ===== BEGIN 32B-SWIZZLE DIFFERENCE: logical -> physical shared address =====
 // M/N-major B32 layout for FP16 (T = 128 / 16 = 8):
 //   ((8, 2, 4), (8, 2)) : ((1, 8, 128), (16, 512))
-// before applying the FP16-upcast form of CUTLASS's bit-layout
-// Swizzle<1,4,3>, namely Swizzle<1,0,3> in half-element units. This is for a
-// 64x16 A tile; replace m by n for a 16x64 B tile. The swizzle XORs bit 3 into
-// bit 0 of that *canonical* physical half-element address. Applying it to a
-// flat row-major index is incorrect.
+// CUTLASS's smem_ptr_flag keeps Swizzle<1,4,3> BYTE-addressed even when the
+// underlying layout is upcast from bits to half elements. Convert bytes to
+// half elements: Swizzle<1,3,3>, i.e. half-index bit 6 XORs into bit 3.
+// A uses mn=m; B uses mn=n. The base must be aligned to 256 bytes.
 __device__ __forceinline__ int swizzle_32b_half_index(int mn, int k) {
   const int canonical = (mn & 7) + ((mn >> 3) & 1) * 8 +
                         (mn >> 4) * 128 + (k & 7) * 16 +
                         (k >> 3) * 512;
-  return canonical ^ ((canonical & 0x8) >> 3);
+  const int byte_offset = canonical * 2;
+  const int swizzled_bytes = byte_offset ^ ((byte_offset & 0x80) >> 3);
+  return swizzled_bytes / 2;  // equivalent: canonical ^ ((canonical & 0x40) >> 3)
 }
 // ===== END 32B-SWIZZLE DIFFERENCE =====
 
@@ -234,6 +235,8 @@ static float reference_element(int row, int col, bool identity_a, bool identity_
 }
 
 int main(int argc, char** argv) {
+  std::printf("Layout revision: MN-B32-byte-v1; WGMMA_USE_32B_SWIZZLE=%d\n",
+              WGMMA_USE_32B_SWIZZLE);
   const bool identity_a = argc == 2 && std::strcmp(argv[1], "--identity-a") == 0;
   const bool identity_b = argc == 2 && std::strcmp(argv[1], "--identity-b") == 0;
   const bool identity_a_n = argc == 2 && std::strcmp(argv[1], "--identity-a-n") == 0;
@@ -318,7 +321,8 @@ int main(int argc, char** argv) {
     }
   }
   const double tflops = (2.0 * M * N * K) / (static_cast<double>(milliseconds) * 1.0e9);
-  std::printf("WGMMA m64n64k16 FP16xFP16->FP32, M=N=K=4096\n");
+  std::printf("WGMMA m64n64k16 FP16xFP16->FP32, M=N=K=4096, shared layout: %s\n",
+              WGMMA_USE_32B_SWIZZLE ? "32B swizzle" : "no swizzle");
   std::printf("GEMM duration: %.3f ms, throughput: %.2f TFLOP/s\n", milliseconds, tflops);
   std::printf("Validation (256 CPU-reference samples): max abs error = %.8g %s\n",
               max_abs_error, max_abs_error == 0.0f ? "PASS" : "FAIL");
