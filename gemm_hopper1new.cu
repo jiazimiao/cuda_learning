@@ -60,14 +60,16 @@ __device__ __forceinline__ uint64_t make_wgmma_desc(const void* smem,
 // ===== BEGIN 32B-SWIZZLE DIFFERENCE: logical -> physical shared address =====
 // M/N-major B32 layout for FP16 (T = 128 / 16 = 8):
 //   ((8, 2, 4), (8, 2)) : ((1, 8, 128), (16, 512))
-// before applying Swizzle<1,4,3>.  This is for a 64x16 A tile; replace m by n
-// for a 16x64 B tile.  The swizzle XORs bit 7 into bit 3 of that *canonical*
-// physical address.  Applying it to a flat row-major index is incorrect.
+// before applying the FP16-upcast form of CUTLASS's bit-layout
+// Swizzle<1,4,3>, namely Swizzle<1,0,3> in half-element units. This is for a
+// 64x16 A tile; replace m by n for a 16x64 B tile. The swizzle XORs bit 3 into
+// bit 0 of that *canonical* physical half-element address. Applying it to a
+// flat row-major index is incorrect.
 __device__ __forceinline__ int swizzle_32b_half_index(int mn, int k) {
   const int canonical = (mn & 7) + ((mn >> 3) & 1) * 8 +
                         (mn >> 4) * 128 + (k & 7) * 16 +
                         (k >> 3) * 512;
-  return canonical ^ ((canonical & 0x80) >> 4);
+  return canonical ^ ((canonical & 0x8) >> 3);
 }
 // ===== END 32B-SWIZZLE DIFFERENCE =====
 
