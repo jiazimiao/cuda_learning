@@ -223,8 +223,13 @@ static float reference_element(int row, int col, bool identity_a, bool identity_
 int main(int argc, char** argv) {
   const bool identity_a = argc == 2 && std::strcmp(argv[1], "--identity-a") == 0;
   const bool identity_b = argc == 2 && std::strcmp(argv[1], "--identity-b") == 0;
-  if (argc > 1 && !identity_a && !identity_b) {
-    std::fprintf(stderr, "Usage: %s [--identity-a | --identity-b]\\n", argv[0]);
+  const bool identity_a_n = argc == 2 && std::strcmp(argv[1], "--identity-a-n") == 0;
+  const bool identity_a_k = argc == 2 && std::strcmp(argv[1], "--identity-a-k") == 0;
+  const bool any_identity_a = identity_a || identity_a_n || identity_a_k;
+  if (argc > 1 && !any_identity_a && !identity_b) {
+    std::fprintf(stderr,
+                 "Usage: %s [--identity-a | --identity-b | --identity-a-n | --identity-a-k]\\n",
+                 argv[0]);
     return EXIT_FAILURE;
   }
   int device = 0, major = 0, minor = 0;
@@ -243,10 +248,13 @@ int main(int argc, char** argv) {
   std::vector<half> hB(static_cast<size_t>(K) * N);
   for (int i = 0; i < M; ++i)
     for (int k = 0; k < K; ++k)
-      hA[static_cast<size_t>(i) * K + k] = __float2half_rn(identity_a ? (i == k ? 1.0f : 0.0f) : host_a(i, k));
+      hA[static_cast<size_t>(i) * K + k] = __float2half_rn(any_identity_a ? (i == k ? 1.0f : 0.0f) : host_a(i, k));
   for (int k = 0; k < K; ++k)
     for (int j = 0; j < N; ++j)
-      hB[static_cast<size_t>(k) * N + j] = __float2half_rn(identity_b ? (k == j ? 1.0f : 0.0f) : host_b(k, j));
+      hB[static_cast<size_t>(k) * N + j] = __float2half_rn(
+          identity_b ? (k == j ? 1.0f : 0.0f) :
+          identity_a_n ? static_cast<float>(j & 63) :
+          identity_a_k ? static_cast<float>(k & 63) : host_b(k, j));
 
   half *dA = nullptr, *dB = nullptr;
   float* dC = nullptr;
@@ -284,7 +292,9 @@ int main(int argc, char** argv) {
   for (int sample = 0; sample < 256; ++sample) {
     const int i = (sample * 997) & (M - 1);
     const int j = (sample * 619) & (N - 1);
-    const float expected = reference_element(i, j, identity_a, identity_b);
+    const float expected = identity_a_n ? static_cast<float>(j & 63) :
+                           identity_a_k ? static_cast<float>(i & 63) :
+                           reference_element(i, j, identity_a, identity_b);
     const float actual = hC[static_cast<size_t>(i) * N + j];
     const float abs_error = std::abs(actual - expected);
     max_abs_error = std::max(max_abs_error, abs_error);
