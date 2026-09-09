@@ -26,7 +26,7 @@ constexpr int WK = 16;
 constexpr int WARP_GROUP_THREADS = 128;
 
 #ifndef WGMMA_USE_32B_SWIZZLE
-#define WGMMA_USE_32B_SWIZZLE 0
+#define WGMMA_USE_32B_SWIZZLE 1
 #endif
 
 #define CUDA_CHECK(call)                                                        \
