@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 constexpr int M = 4096;
@@ -211,13 +212,21 @@ static float host_b(int row, int col) {
   return static_cast<float>(((row * 19 + col * 11) % 7) - 3) * 0.125f;
 }
 
-static float reference_element(int row, int col) {
+static float reference_element(int row, int col, bool identity_a, bool identity_b) {
+  if (identity_a) return host_b(row, col);  // A is I, so C = B.
+  if (identity_b) return host_a(row, col);  // B is I, so C = A.
   float sum = 0.0f;
   for (int k = 0; k < K; ++k) sum += host_a(row, k) * host_b(k, col);
   return sum;
 }
 
-int main() {
+int main(int argc, char** argv) {
+  const bool identity_a = argc == 2 && std::strcmp(argv[1], "--identity-a") == 0;
+  const bool identity_b = argc == 2 && std::strcmp(argv[1], "--identity-b") == 0;
+  if (argc > 1 && !identity_a && !identity_b) {
+    std::fprintf(stderr, "Usage: %s [--identity-a | --identity-b]\\n", argv[0]);
+    return EXIT_FAILURE;
+  }
   int device = 0, major = 0, minor = 0;
   CUDA_CHECK(cudaGetDevice(&device));
   CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
@@ -233,9 +242,11 @@ int main() {
   std::vector<half> hA(static_cast<size_t>(M) * K);
   std::vector<half> hB(static_cast<size_t>(K) * N);
   for (int i = 0; i < M; ++i)
-    for (int k = 0; k < K; ++k) hA[static_cast<size_t>(i) * K + k] = __float2half_rn(host_a(i, k));
+    for (int k = 0; k < K; ++k)
+      hA[static_cast<size_t>(i) * K + k] = __float2half_rn(identity_a ? (i == k ? 1.0f : 0.0f) : host_a(i, k));
   for (int k = 0; k < K; ++k)
-    for (int j = 0; j < N; ++j) hB[static_cast<size_t>(k) * N + j] = __float2half_rn(host_b(k, j));
+    for (int j = 0; j < N; ++j)
+      hB[static_cast<size_t>(k) * N + j] = __float2half_rn(identity_b ? (k == j ? 1.0f : 0.0f) : host_b(k, j));
 
   half *dA = nullptr, *dB = nullptr;
   float* dC = nullptr;
@@ -273,7 +284,7 @@ int main() {
   for (int sample = 0; sample < 256; ++sample) {
     const int i = (sample * 997) & (M - 1);
     const int j = (sample * 619) & (N - 1);
-    const float expected = reference_element(i, j);
+    const float expected = reference_element(i, j, identity_a, identity_b);
     const float actual = hC[static_cast<size_t>(i) * N + j];
     const float abs_error = std::abs(actual - expected);
     max_abs_error = std::max(max_abs_error, abs_error);
