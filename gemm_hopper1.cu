@@ -1,395 +1,336 @@
-#include <cuda_runtime.h>
-#include <cuda/barrier>
-#include <cuda_fp16.h>
-#include <cooperative_groups.h>
+// Build (CUDA 12.0 or newer):
+//   nvcc -O3 -arch=sm_90a -o wgmma_m64n64k16 wgmma_m64n64k16.cu
+//
+// This is a deliberately small, correctness-oriented WGMMA GEMM.  It uses one
+// 128-thread warpgroup per CTA and one m64n64k16 WGMMA per K tile.  It is not
+// intended to rival a pipelined CUTLASS kernel; the wait_group<0> inside the K
+// loop makes the control flow and shared-memory reuse unambiguous.
 
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <ctime>
+#include <cstring>
 #include <vector>
 
-namespace cg = cooperative_groups;
-
-// Hopper GEMM learning kernel, no CUTLASS and no CuTe.
-//
-// Design:
-//   - one CTA = one warpgroup = 128 threads
-//   - one CTA computes one 64x64 C tile
-//   - fp16 A/B, fp32 accumulation, fp32 C
-//   - cuda::memcpy_async + cuda::barrier stages gmem -> smem
-//   - inline PTX wgmma.mma_async does smem -> tensor core -> registers
-//
-// Notes:
-//   - This is a learning kernel, not a tuned GEMM.
-//   - N must be a multiple of 64, so all tiles are full.
-//   - On Hopper+, the cuda::memcpy_async barrier overload may map to TMA
-//     cp.async.bulk when alignment and memory-space conditions are satisfied.
-//   - WGMMA itself has no CUDA C++ API like WMMA, so inline PTX is used.
-//
-// Build on H100/H800:
-//   nvcc -std=c++17 -O3 -arch=sm_90a \
-//        gemm_hopper_no_cutlass_no_cute.cu -o gemm_hopper_no_cutlass
-//
-// Run:
-//   ./gemm_hopper_no_cutlass 256
-//   ./gemm_hopper_no_cutlass 4096
-
-constexpr int BLOCK_M = 64;
-constexpr int BLOCK_N = 64;
-constexpr int BLOCK_K = 32;
-constexpr int WGMMA_K = 16;
+constexpr int M = 4096;
+constexpr int N = 4096;
+constexpr int K = 4096;
+constexpr int WM = 64;
+constexpr int WN = 64;
+constexpr int WK = 16;
 constexpr int WARP_GROUP_THREADS = 128;
-constexpr int STAGES = 2;
 
-constexpr int A_LD_SMEM = BLOCK_K;
-constexpr int B_LD_SMEM = BLOCK_N;
+#ifndef WGMMA_USE_32B_SWIZZLE
+#define WGMMA_USE_32B_SWIZZLE 1
+#endif
 
-#define CUDA_CHECK(call)                                                 \
-    do                                                                   \
-    {                                                                    \
-        cudaError_t err = (call);                                        \
-        if (err != cudaSuccess)                                          \
-        {                                                                \
-            std::printf("CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
-                        cudaGetErrorString(err));                        \
-            std::exit(EXIT_FAILURE);                                     \
-        }                                                                \
-    } while (0)
+#define CUDA_CHECK(call)                                                        \
+  do {                                                                          \
+    cudaError_t status_ = (call);                                               \
+    if (status_ != cudaSuccess) {                                               \
+      std::fprintf(stderr, "%s:%d: CUDA error: %s\n", __FILE__, __LINE__,    \
+                   cudaGetErrorString(status_));                                \
+      std::exit(EXIT_FAILURE);                                                  \
+    }                                                                           \
+  } while (0)
 
-static float rand_float()
-{
-    return static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX) - 0.5f;
+// WGMMA's descriptor stores these three quantities as (bytes >> 4):
+// [13:0] start address, [29:16] leading (K) core offset,
+// [45:32] stride (M/N) core offset.
+__device__ __forceinline__ uint64_t make_wgmma_desc(const void* smem,
+                                                     uint32_t leading_bytes,
+                                                     uint32_t stride_bytes) {
+  const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  uint64_t desc = (static_cast<uint64_t>((address       & 0x3ffffu) >> 4)      ) |
+                  (static_cast<uint64_t>((leading_bytes & 0x3ffffu) >> 4) << 16) |
+                  (static_cast<uint64_t>((stride_bytes  & 0x3ffffu) >> 4) << 32);
+#if WGMMA_USE_32B_SWIZZLE
+  // ===== BEGIN 32B-SWIZZLE DIFFERENCE: descriptor layout type =====
+  desc |= 3ull << 62;  // SM90 WGMMA B32 swizzle
+  // ===== END 32B-SWIZZLE DIFFERENCE =====
+#endif
+  return desc;
 }
 
-__device__ __forceinline__ uint32_t smem_u32addr(const void *ptr)
-{
-    return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+// ===== BEGIN 32B-SWIZZLE DIFFERENCE: logical -> physical shared address =====
+// M/N-major B32 layout for FP16 (T = 128 / 16 = 8):
+//   ((8, 2, 4), (8, 2)) : ((1, 8, 128), (16, 512))
+// CUTLASS's smem_ptr_flag keeps Swizzle<1,4,3> BYTE-addressed even when the
+// underlying layout is upcast from bits to half elements. Convert bytes to
+// half elements: Swizzle<1,3,3>, i.e. half-index bit 6 XORs into bit 3.
+// A uses mn=m; B uses mn=n. The base must be aligned to 256 bytes.
+__device__ __forceinline__ int swizzle_32b_half_index(int mn, int k) {
+  const int canonical = (mn & 7) + ((mn >> 3) & 1) * 8 +
+                        (mn >> 4) * 128 + (k & 7) * 16 +
+                        (k >> 3) * 512;
+  const int byte_offset = canonical * 2;
+  const int swizzled_bytes = byte_offset ^ ((byte_offset & 0x80) >> 3);
+  return swizzled_bytes / 2;  // equivalent: canonical ^ ((canonical & 0x40) >> 3)
+}
+// ===== END 32B-SWIZZLE DIFFERENCE =====
+
+// No-swizzle M/N-major WGMMA storage is not a normal flat row-major array.
+// It is a sequence of 8x8 cores, and every core is stored transposed. This
+// matches imm-trans-a=1 / imm-trans-b=1 while global A[M,K] and B[K,N] stay
+// row-major. Core order is K-major, then M (for A) or N (for B).
+__device__ __forceinline__ int noswizzle_a_index(int m, int k) {
+  return ((m >> 3) * 2 + (k >> 3)) * 64 + (k & 7) * 8 + (m & 7);
 }
 
-__device__ __forceinline__ uint64_t make_wgmma_desc(const void *smem_ptr,
-                                                    int leading_byte_offset,
-                                                    int stride_byte_offset)
-{
-    const uint64_t start = static_cast<uint64_t>(smem_u32addr(smem_ptr) >> 4);
-    const uint64_t lbo = static_cast<uint64_t>(leading_byte_offset >> 4);
-    const uint64_t sbo = static_cast<uint64_t>(stride_byte_offset >> 4);
-
-    // Unswizzled WGMMA shared-memory descriptor:
-    //   bits [0:13]   base address / 16
-    //   bits [16:29]  leading dimension byte offset / 16
-    //   bits [32:45]  stride dimension byte offset / 16
-    return (start & 0x3fffULL) |
-           ((lbo & 0x3fffULL) << 16) |
-           ((sbo & 0x3fffULL) << 32);
+__device__ __forceinline__ int noswizzle_b_index(int k, int n) {
+  return ((n >> 3) * 2 + (k >> 3)) * 64 + (k & 7) * 8 + (n & 7);
 }
 
-__device__ __forceinline__ void wgmma_fence()
-{
-    asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
+__device__ __forceinline__ void fence_proxy_async_shared_cta() {
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
 
-__device__ __forceinline__ void wgmma_commit_group()
-{
-    asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
+__device__ __forceinline__ void wgmma_fence() {
+  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
 
-__device__ __forceinline__ void wgmma_wait_group_0()
-{
-    asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
+__device__ __forceinline__ void wgmma_commit_group() {
+  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 }
 
-__device__ __forceinline__ void wgmma_m64n64k16_f16_f32(float (&d)[32],
-                                                        uint64_t desc_a,
-                                                        uint64_t desc_b,
-                                                        int scale_d)
-{
-    // A and B are both in shared memory. This instruction is warpgroup-scoped:
-    // all 128 threads in the CTA execute it together.
-    asm volatile(
-        "{\n"
-        ".reg .pred p;\n"
-        "setp.ne.b32 p, %34, 0;\n"
-        "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
-        "{%0, %1, %2, %3, %4, %5, %6, %7, "
-        "%8, %9, %10, %11, %12, %13, %14, %15, "
-        "%16, %17, %18, %19, %20, %21, %22, %23, "
-        "%24, %25, %26, %27, %28, %29, %30, %31}, "
-        "%32, %33, p, 1, 1, 0, 0;\n"
-        "}\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-          "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-          "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
-        : "l"(desc_a), "l"(desc_b), "r"(scale_d)
-        : "memory");
+__device__ __forceinline__ void wgmma_wait_group_0() {
+  asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 }
 
-__device__ __forceinline__ void store_wgmma_m64n64(float *C,
-                                                   const float (&acc)[32],
-                                                   int N,
-                                                   int block_m,
-                                                   int block_n)
-{
-    // D-fragment mapping for wgmma.mma_async m64n64 with fp32 accumulators.
-    // Each thread owns 32 fp32 values. Across 128 threads that is 4096 values,
-    // exactly one 64x64 tile.
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int lane_row = lane >> 2;
-    const int lane_col_pair = lane & 3;
+// Each lane owns N/2 = 32 FP32 registers for m64n64k16.  The accumulator is
+// read-write (+f): the instruction implements D = A*B + D (scale-d == 1).
+__device__ __forceinline__ void wgmma_m64n64k16_f32_f16_f16(
+    float (&d)[32], uint64_t desc_a, uint64_t desc_b) {
+  constexpr int scale_d = 1;
+  asm volatile(
+      "{\n"
+      "  .reg .pred p;\n"
+      "  setp.ne.b32 p, %34, 0;\n"
+      "  wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
+      "{%0, %1, %2, %3, %4, %5, %6, %7, "
+      " %8, %9, %10, %11, %12, %13, %14, %15, "
+      " %16, %17, %18, %19, %20, %21, %22, %23, "
+      " %24, %25, %26, %27, %28, %29, %30, %31}, "
+      "%32, %33, p, 1, 1, 1, 1;\n"
+      "}\n"
+      : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]),
+        "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]),
+        "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]),
+        "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
+        "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
+        "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
+        "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+      : "l"(desc_a), "l"(desc_b), "r"(scale_d)
+      : "memory");
+}
 
+__global__ __launch_bounds__(WARP_GROUP_THREADS)
+void wgmma_gemm_4096(const half* __restrict__ A,
+                     const half* __restrict__ B,
+                     float* __restrict__ C) {
+  // Logical A is row-major [64][16] and logical B is column-major [16][64].
+#if WGMMA_USE_32B_SWIZZLE
+  // ===== BEGIN 32B-SWIZZLE DIFFERENCE: 256B base alignment =====
+  __shared__ __align__(256) half sA[WM * WK];
+  __shared__ __align__(256) half sB[WN * WK];
+  // ===== END 32B-SWIZZLE DIFFERENCE =====
+#else
+  // Physical shared-memory storage is the no-swizzle 8x8-core layout.
+  __shared__ __align__(16) half sA[WM * WK];
+  __shared__ __align__(16) half sB[WN * WK];
+#endif
+
+  const int tid = threadIdx.x;
+  const int block_m = blockIdx.y * WM;
+  const int block_n = blockIdx.x * WN;
+  float d[32] = {};
+
+  // All four contiguous warps execute every WGMMA instruction identically.
+  wgmma_fence();
+
+  #pragma unroll 1
+  for (int k0 = 0; k0 < K; k0 += WK) {
+    // 128 threads cooperatively stage both 2 KiB operands.
     #pragma unroll
-    for (int col_group = 0; col_group < 8; ++col_group)
-    {
-        #pragma unroll
-        for (int row_half = 0; row_half < 2; ++row_half)
-        {
-            #pragma unroll
-            for (int col_in_pair = 0; col_in_pair < 2; ++col_in_pair)
-            {
-                const int reg = col_group * 4 + row_half * 2 + col_in_pair;
-                const int row = block_m + warp * 16 + lane_row + row_half * 8;
-                const int col = block_n + col_group * 8 + lane_col_pair * 2 + col_in_pair;
-                C[row * N + col] = acc[reg];
-            }
-        }
-    }
-}
-
-__global__ __launch_bounds__(WARP_GROUP_THREADS) void gemm_hopper_kernel(
-    const half *A,
-    const half *B,
-    float *C,
-    int N)
-{
-// #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ < 900)
-//     if (threadIdx.x == 0)
-//     {
-//         printf("This kernel requires Hopper and must be compiled with -arch=sm_90a.\\n");
-//     }
-//     return;
-// #else
-    const int tid = threadIdx.x;
-    const int block_m = blockIdx.y * BLOCK_M;
-    const int block_n = blockIdx.x * BLOCK_N;
-    const cg::thread_block cta = cg::this_thread_block();
-
-    __align__(16) __shared__ half sA[STAGES][BLOCK_M][A_LD_SMEM];
-    __align__(16) __shared__ half sB[STAGES][BLOCK_K][B_LD_SMEM];
-
-    #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ cuda::barrier<cuda::thread_scope_block> tma_bar[STAGES];
-
-    if (tid == 0)
-    {
-        init(&tma_bar[0], WARP_GROUP_THREADS);
-        init(&tma_bar[1], WARP_GROUP_THREADS);
+    for (int e = tid; e < WM * WK; e += WARP_GROUP_THREADS) {
+      const int row = e / WK;
+      const int col = e % WK;
+#if WGMMA_USE_32B_SWIZZLE
+      // ===== BEGIN 32B-SWIZZLE DIFFERENCE: swizzled shared stores =====
+      sA[swizzle_32b_half_index(row, col)] = A[(block_m + row) * K + k0 + col];
+      sB[swizzle_32b_half_index(row, col)] = B[(k0 + col) * N + block_n + row];
+      // ===== END 32B-SWIZZLE DIFFERENCE =====
+#else
+      sA[noswizzle_a_index(row, col)] = A[(block_m + row) * K + k0 + col];
+      sB[noswizzle_b_index(col, row)] = B[(k0 + col) * N + block_n + row];
+#endif
     }
     __syncthreads();
 
-    float acc[32];
-    #pragma unroll
-    for (int i = 0; i < 32; ++i)
-    {
-        acc[i] = 0.0f;
-    }
+    // Every writer publishes its generic shared-memory stores to WGMMA's async
+    // proxy before the warpgroup consumes sA/sB.
+    fence_proxy_async_shared_cta();
+    // A proxy fence is per-thread.  This CTA rendezvous ensures every writer's
+    // fence has happened before any warp starts the warpgroup MMA.
+    __syncthreads();
 
-    auto load_stage = [&](int stage, int tile_k) {
-        // TMA-capable CUDA C++ interface path. Each call is a cooperative
-        // aligned gmem->smem bulk copy bound to a shared-memory barrier.
-        #pragma unroll
-        for (int r = 0; r < BLOCK_M; ++r)
-        {
-            cuda::memcpy_async(
-                cta,
-                &sA[stage][r][0],
-                &A[(block_m + r) * N + tile_k],
-                cuda::aligned_size_t<16>(BLOCK_K * sizeof(half)),
-                tma_bar[stage]);
-        }
+#if WGMMA_USE_32B_SWIZZLE
+    // ===== BEGIN 32B-SWIZZLE DIFFERENCE: B32 layout descriptor =====
+    // M/N-major B32: LBO is 128 FP16 values = 256B, and SBO is 512 FP16
+    // values = 1024B.  (The LBO-is-ignored rule applies only to K-major
+    // swizzled layouts, which this kernel deliberately does not use.)
+    const uint64_t desc_a = make_wgmma_desc(sA, 256, 1024);
+    const uint64_t desc_b = make_wgmma_desc(sB, 256, 1024);
+    // ===== END 32B-SWIZZLE DIFFERENCE =====
+#else
+    // An 8x8 FP16 core is 128B. K has two core matrices, so adjacent M/N
+    // cores are 2 * 128 = 256B apart.
+    const uint64_t desc_a = make_wgmma_desc(sA, 128, 256);
+    const uint64_t desc_b = make_wgmma_desc(sB, 128, 256);
+#endif
+    wgmma_m64n64k16_f32_f16_f16(d, desc_a, desc_b);
+    wgmma_commit_group();
+    wgmma_wait_group_0();  // d and sA/sB are not accessed before completion.
+    __syncthreads();       // safe to overwrite the shared tiles next iteration.
+  }
 
-        #pragma unroll
-        for (int r = 0; r < BLOCK_K; ++r)
-        {
-            cuda::memcpy_async(
-                cta,
-                &sB[stage][r][0],
-                &B[(tile_k + r) * N + block_n],
-                cuda::aligned_size_t<16>(BLOCK_N * sizeof(half)),
-                tma_bar[stage]);
-        }
-    };
-
-    int stage = 0;
-    load_stage(stage, 0);
-
-    for (int tile_k = 0; tile_k < N; tile_k += BLOCK_K)
-    {
-        const int next_stage = stage ^ 1;
-        const int next_tile_k = tile_k + BLOCK_K;
-
-        if (next_tile_k < N)
-        {
-            load_stage(next_stage, next_tile_k);
-        }
-
-        tma_bar[stage].arrive_and_wait();
-        __syncthreads();
-
-        // WGMMA reads shared memory through the async proxy. This fence orders
-        // the completed shared-memory writes before WGMMA's async-proxy reads.
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        wgmma_fence();
-
-        #pragma unroll
-        for (int k_inner = 0; k_inner < BLOCK_K; k_inner += WGMMA_K)
-        {
-            const uint64_t desc_a = make_wgmma_desc(
-                &sA[stage][0][k_inner],
-                16,
-                8 * A_LD_SMEM * static_cast<int>(sizeof(half)));
-            const uint64_t desc_b = make_wgmma_desc(
-                &sB[stage][k_inner][0],
-                16,
-                B_LD_SMEM * static_cast<int>(sizeof(half)));
-
-            wgmma_m64n64k16_f16_f32(acc, desc_a, desc_b,
-                                    (tile_k == 0 && k_inner == 0) ? 0 : 1);
-            wgmma_commit_group();
-            wgmma_wait_group_0();
-        }
-
-        __syncthreads();
-        stage = next_stage;
-    }
-
-    wgmma_wait_group_0();
-    store_wgmma_m64n64(C, acc, N, block_m, block_n);
-// #endif
+  // PTX's m64nNk16 FP32 accumulator layout for a 128-thread warpgroup:
+  // each warp owns 16 rows; lane bits [4:2] select a row in each 8-row half,
+  // lane bits [1:0] select a pair of columns, and each four registers cover
+  // two rows x two columns for one 8-column group.
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int row0 = warp * 16 + (lane >> 2);
+  const int col2 = (lane & 3) * 2;
+  #pragma unroll
+  for (int group = 0; group < 8; ++group) {
+    const int c = block_n + group * 8 + col2;
+    const int r = group * 4;
+    C[(block_m + row0)     * N + c]     = d[r + 0];
+    C[(block_m + row0)     * N + c + 1] = d[r + 1];
+    C[(block_m + row0 + 8) * N + c]     = d[r + 2];
+    C[(block_m + row0 + 8) * N + c + 1] = d[r + 3];
+  }
 }
 
-int main(int argc, char **argv)
-{
-    std::srand(static_cast<unsigned>(std::time(nullptr)));
+static float host_a(int row, int col) {
+  return static_cast<float>(((row * 17 + col * 13) % 7) - 3) * 0.125f;
+}
+static float host_b(int row, int col) {
+  return static_cast<float>(((row * 19 + col * 11) % 7) - 3) * 0.125f;
+}
 
-    const int N = (argc > 1) ? std::atoi(argv[1]) : 1024;
-    if (N <= 0 || N % BLOCK_M != 0)
-    {
-        std::printf("Usage: %s [N], where N is a positive multiple of %d.\n",
-                    argv[0], BLOCK_M);
-        return 1;
+static float reference_element(int row, int col, bool identity_a, bool identity_b) {
+  if (identity_a) return host_b(row, col);  // A is I, so C = B.
+  if (identity_b) return host_a(row, col);  // B is I, so C = A.
+  float sum = 0.0f;
+  for (int k = 0; k < K; ++k) sum += host_a(row, k) * host_b(k, col);
+  return sum;
+}
+
+int main(int argc, char** argv) {
+  std::printf("Layout revision: MN-B32-byte-v1; WGMMA_USE_32B_SWIZZLE=%d\n",
+              WGMMA_USE_32B_SWIZZLE);
+  const bool identity_a = argc == 2 && std::strcmp(argv[1], "--identity-a") == 0;
+  const bool identity_b = argc == 2 && std::strcmp(argv[1], "--identity-b") == 0;
+  const bool identity_a_n = argc == 2 && std::strcmp(argv[1], "--identity-a-n") == 0;
+  const bool identity_a_k = argc == 2 && std::strcmp(argv[1], "--identity-a-k") == 0;
+  const bool any_identity_a = identity_a || identity_a_n || identity_a_k;
+  if (argc > 1 && !any_identity_a && !identity_b) {
+    std::fprintf(stderr,
+                 "Usage: %s [--identity-a | --identity-b | --identity-a-n | --identity-a-k]\\n",
+                 argv[0]);
+    return EXIT_FAILURE;
+  }
+  int device = 0, major = 0, minor = 0;
+  CUDA_CHECK(cudaGetDevice(&device));
+  CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+  CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+  if (major != 9) {
+    std::fprintf(stderr, "This program requires Hopper SM90a; found compute capability %d.%d.\n",
+                 major, minor);
+    return EXIT_FAILURE;
+  }
+
+  const size_t ab_bytes = static_cast<size_t>(M) * K * sizeof(half);
+  const size_t c_bytes = static_cast<size_t>(M) * N * sizeof(float);
+  std::vector<half> hA(static_cast<size_t>(M) * K);
+  std::vector<half> hB(static_cast<size_t>(K) * N);
+  for (int i = 0; i < M; ++i)
+    for (int k = 0; k < K; ++k)
+      hA[static_cast<size_t>(i) * K + k] = __float2half_rn(any_identity_a ? (i == k ? 1.0f : 0.0f) : host_a(i, k));
+  for (int k = 0; k < K; ++k)
+    for (int j = 0; j < N; ++j)
+      hB[static_cast<size_t>(k) * N + j] = __float2half_rn(
+          identity_b ? (k == j ? 1.0f : 0.0f) :
+          identity_a_n ? static_cast<float>(j & 63) :
+          identity_a_k ? static_cast<float>(k & 63) : host_b(k, j));
+
+  half *dA = nullptr, *dB = nullptr;
+  float* dC = nullptr;
+  CUDA_CHECK(cudaMalloc(&dA, ab_bytes));
+  CUDA_CHECK(cudaMalloc(&dB, ab_bytes));
+  CUDA_CHECK(cudaMalloc(&dC, c_bytes));
+  CUDA_CHECK(cudaMemcpy(dA, hA.data(), ab_bytes, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(dB, hB.data(), ab_bytes, cudaMemcpyHostToDevice));
+
+  const dim3 block(WARP_GROUP_THREADS);
+  const dim3 grid(N / WN, M / WM);
+  for (int i = 0; i < 5; ++i) wgmma_gemm_4096<<<grid, block>>>(dA, dB, dC);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  cudaEvent_t begin, end;
+  CUDA_CHECK(cudaEventCreate(&begin));
+  CUDA_CHECK(cudaEventCreate(&end));
+  constexpr int kIters = 20;
+  CUDA_CHECK(cudaEventRecord(begin));
+  for (int i = 0; i < kIters; ++i) wgmma_gemm_4096<<<grid, block>>>(dA, dB, dC);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaEventRecord(end));
+  CUDA_CHECK(cudaEventSynchronize(end));
+  float milliseconds = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&milliseconds, begin, end));
+  milliseconds /= kIters;
+
+  std::vector<float> hC(static_cast<size_t>(M) * N);
+  CUDA_CHECK(cudaMemcpy(hC.data(), dC, c_bytes, cudaMemcpyDeviceToHost));
+  float max_abs_error = 0.0f;
+  int mismatches_reported = 0;
+  // The inputs are binary-exact multiples of 1/8, so these FP32 sums are exact
+  // at this size.  Check a spread of output elements without an O(N^3) host GEMM.
+  for (int sample = 0; sample < 256; ++sample) {
+    const int i = (sample * 997) & (M - 1);
+    const int j = (sample * 619) & (N - 1);
+    const float expected = identity_a_n ? static_cast<float>(j & 63) :
+                           identity_a_k ? static_cast<float>(i & 63) :
+                           reference_element(i, j, identity_a, identity_b);
+    const float actual = hC[static_cast<size_t>(i) * N + j];
+    const float abs_error = std::abs(actual - expected);
+    max_abs_error = std::max(max_abs_error, abs_error);
+    if (abs_error != 0.0f && mismatches_reported < 8) {
+      std::printf("  mismatch C[%d,%d]: GPU=%g CPU=%g abs_err=%g\\n",
+                  i, j, actual, expected, abs_error);
+      ++mismatches_reported;
     }
+  }
+  const double tflops = (2.0 * M * N * K) / (static_cast<double>(milliseconds) * 1.0e9);
+  std::printf("WGMMA m64n64k16 FP16xFP16->FP32, M=N=K=4096, shared layout: %s\n",
+              WGMMA_USE_32B_SWIZZLE ? "32B swizzle" : "no swizzle");
+  std::printf("GEMM duration: %.3f ms, throughput: %.2f TFLOP/s\n", milliseconds, tflops);
+  std::printf("Validation (256 CPU-reference samples): max abs error = %.8g %s\n",
+              max_abs_error, max_abs_error == 0.0f ? "PASS" : "FAIL");
 
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    if (prop.major < 9)
-    {
-        std::printf("This example requires Hopper, compute capability 9.x.\\n");
-        return 1;
-    }
-
-    const size_t elems = static_cast<size_t>(N) * N;
-    const size_t half_bytes = elems * sizeof(half);
-    const size_t float_bytes = elems * sizeof(float);
-
-    std::vector<float> hA_float(elems);
-    std::vector<float> hB_float(elems);
-    std::vector<half> hA(elems);
-    std::vector<half> hB(elems);
-    std::vector<float> hC(elems, 0.0f);
-    std::vector<float> hRef(elems, 0.0f);
-
-    for (size_t i = 0; i < elems; ++i)
-    {
-        hA_float[i] = rand_float();
-        hB_float[i] = rand_float();
-        hA[i] = __float2half(hA_float[i]);
-        hB[i] = __float2half(hB_float[i]);
-    }
-
-    const bool check_result = N <= 512;
-    if (check_result)
-    {
-        for (int row = 0; row < N; ++row)
-        {
-            for (int col = 0; col < N; ++col)
-            {
-                float sum = 0.0f;
-                for (int k = 0; k < N; ++k)
-                {
-                    sum += __half2float(hA[row * N + k]) *
-                           __half2float(hB[k * N + col]);
-                }
-                hRef[row * N + col] = sum;
-            }
-        }
-    }
-
-    half *dA = nullptr;
-    half *dB = nullptr;
-    float *dC = nullptr;
-    CUDA_CHECK(cudaMalloc(&dA, half_bytes));
-    CUDA_CHECK(cudaMalloc(&dB, half_bytes));
-    CUDA_CHECK(cudaMalloc(&dC, float_bytes));
-    CUDA_CHECK(cudaMemcpy(dA, hA.data(), half_bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dB, hB.data(), half_bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(dC, 0, float_bytes));
-
-    dim3 block(WARP_GROUP_THREADS);
-    dim3 grid(N / BLOCK_N, N / BLOCK_M);
-
-    cudaEvent_t start;
-    cudaEvent_t stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-
-    CUDA_CHECK(cudaEventRecord(start));
-    gemm_hopper_kernel<<<grid, block>>>(dA, dB, dC, N);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-
-    float kernel_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start, stop));
-    std::printf("No-CUTLASS Hopper GEMM: N=%d time=%.3f ms\n", N, kernel_ms);
-
-    CUDA_CHECK(cudaMemcpy(hC.data(), dC, float_bytes, cudaMemcpyDeviceToHost));
-
-    bool ok = true;
-    if (check_result)
-    {
-        const float eps = 2e-1f;
-        for (int row = 0; row < N && ok; ++row)
-        {
-            for (int col = 0; col < N; ++col)
-            {
-                const float diff = std::fabs(hC[row * N + col] - hRef[row * N + col]);
-                if (diff > eps)
-                {
-                    std::printf("Mismatch at (%d,%d): gpu=%f ref=%f diff=%f\n",
-                                row, col, hC[row * N + col], hRef[row * N + col], diff);
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        std::printf(ok ? "Result check passed\n" : "Result check failed\n");
-    }
-    else
-    {
-        std::printf("Skip CPU reference for N=%d; use N<=512 to validate.\n", N);
-    }
-
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-    CUDA_CHECK(cudaFree(dA));
-    CUDA_CHECK(cudaFree(dB));
-    CUDA_CHECK(cudaFree(dC));
-
-    return ok ? 0 : 1;
+  CUDA_CHECK(cudaEventDestroy(begin));
+  CUDA_CHECK(cudaEventDestroy(end));
+  CUDA_CHECK(cudaFree(dA));
+  CUDA_CHECK(cudaFree(dB));
+  CUDA_CHECK(cudaFree(dC));
+  return max_abs_error == 0.0f ? EXIT_SUCCESS : EXIT_FAILURE;
 }
