@@ -15,7 +15,7 @@
 #include <cstring>
 #include <vector>
 constexpr int M = 4096, N = 4096, K = 4096;
-constexpr int WM = 64, WN = 64, WK = 16, BK = 64, STAGES = 3;
+constexpr int WM = 64, WN = 64, WK = 16, BK = 64, STAGES = 2;
 constexpr int WARP_GROUP_THREADS = 128;
 constexpr int TILE_ELEMENTS = 64 * 64;
 constexpr int TX_BYTES = 2 * TILE_ELEMENTS * sizeof(half); // A+B = 16384 bytes
