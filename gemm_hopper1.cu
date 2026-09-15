@@ -106,6 +106,8 @@ __device__ __forceinline__ void wgmma_wait_group_0() {
 // read-write (+f): the instruction implements D = A*B + D (scale-d == 1).
 __device__ __forceinline__ void wgmma_m64n64k16_f32_f16_f16(
     float (&d)[32], uint64_t desc_a, uint64_t desc_b) {
+      //why 32：一共64*64（tile大小）=4096个输出，128线程每个线程负责4096/128=32个输出
+      //指令中32个操作数表示该指令要接收当前线程的 32 个独立 FP32 寄存器操作数。传入一个 d 的数组地址，
   constexpr int scale_d = 1;
   asm volatile(
       "{\n"
@@ -289,7 +291,7 @@ int main(int argc, char** argv) {
   cudaEvent_t begin, end;
   CUDA_CHECK(cudaEventCreate(&begin));
   CUDA_CHECK(cudaEventCreate(&end));
-  constexpr int kIters = 20;
+  constexpr int kIters = 1;
   CUDA_CHECK(cudaEventRecord(begin));
   for (int i = 0; i < kIters; ++i) wgmma_gemm_4096<<<grid, block>>>(dA, dB, dC);
   CUDA_CHECK(cudaGetLastError());
