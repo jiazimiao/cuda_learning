@@ -4,6 +4,7 @@
 // Search "TMA CHANGE" for differences from the validated manual-copy version.
 // CUDA 12+; Hopper sm_90a. No architecture fallback.
 // Kernel timing excludes allocation, H2D, tensor-map creation and validation.
+// 也改了写回
 #include <cuda.h> // [TMA CHANGE 1] Host tensor-map encoder
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -15,7 +16,7 @@
 #include <cstring>
 #include <vector>
 constexpr int M = 4096, N = 4096, K = 4096;
-constexpr int WM = 64, WN = 64, WK = 16, BK = 64, STAGES = 4;
+constexpr int WM = 64, WN = 64, WK = 16, BK = 64, STAGES = 2;
 constexpr int WARP_GROUP_THREADS = 128;
 constexpr int BLOCK_THREADS = 160; // 160threads ; 128 threads for WGMMA, 32 threads for TMA async proxy
 constexpr int FIRST_PRODUCER = 128;
@@ -138,12 +139,12 @@ __device__ __forceinline__ void wgmma_m64n64k16_f32_f16_f16(
         : "l"(desc_a), "l"(desc_b), "r"(scale_d)
         : "memory");
 }
-__device__ __forceinline__
-void fence_accumulator(float (&d)[32])
+__device__ __forceinline__ void fence_accumulator(float (&d)[32])
 {
-    #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        asm volatile("" : "+f"(d[i]) :: "memory");
+#pragma unroll
+    for (int i = 0; i < 32; ++i)
+    {
+        asm volatile("" : "+f"(d[i])::"memory");
     }
 }
 
@@ -210,7 +211,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
     {
         float d[32] = {};
         fence_accumulator(d);
-        
+
 #pragma unroll 1
         for (int t = 0; t < K / BK; ++t)
         {
@@ -231,7 +232,6 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
 
             fence_accumulator(d);
 
-
             asm volatile(
                 "mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(shared_addr(&empty[slot]))
                 : "memory");
@@ -245,15 +245,36 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
         const int lane = tid & 31;
         const int row0 = warp * 16 + (lane >> 2);
         const int col2 = (lane & 3) * 2;
+        // #pragma unroll
+        //         for (int group = 0; group < 8; ++group)
+        //         {
+        //             const int c = block_n + group * 8 + col2;
+        //             const int r = group * 4;
+        //             C[(block_m + row0) * N + c] = d[r + 0];
+        //             C[(block_m + row0) * N + c + 1] = d[r + 1];
+        //             C[(block_m + row0 + 8) * N + c] = d[r + 2];
+        //             C[(block_m + row0 + 8) * N + c + 1] = d[r + 3];
+        //         }
+        static_assert(N % 2 == 0, "float2 stores require an even row stride");
+
 #pragma unroll
         for (int group = 0; group < 8; ++group)
         {
             const int c = block_n + group * 8 + col2;
             const int r = group * 4;
-            C[(block_m + row0) * N + c] = d[r + 0];
-            C[(block_m + row0) * N + c + 1] = d[r + 1];
-            C[(block_m + row0 + 8) * N + c] = d[r + 2];
-            C[(block_m + row0 + 8) * N + c + 1] = d[r + 3];
+
+            const size_t index0 =
+                static_cast<size_t>(block_m + row0) * N + c;
+
+            const size_t index1 =
+                static_cast<size_t>(block_m + row0 + 8) * N + c;
+
+            // [改动] 两个相邻 FP32 合成一个 float2 写出。
+            *reinterpret_cast<float2 *>(C + index0) =
+                make_float2(d[r + 0], d[r + 1]);
+
+            *reinterpret_cast<float2 *>(C + index1) =
+                make_float2(d[r + 2], d[r + 3]);
         }
     }
     __syncthreads();
