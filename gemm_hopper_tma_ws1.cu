@@ -210,7 +210,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
     {
         float d[32] = {};
         fence_accumulator(d);
-        wgmma_fence();
+        
 #pragma unroll 1
         for (int t = 0; t < K / BK; ++t)
         {
@@ -218,6 +218,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
             const int generation = t / STAGES;
 
             wait_stage(&full[slot], generation & 1); // all 128 threads acquire
+            wgmma_fence();
 #pragma unroll
             for (int kk = 0; kk < BK; kk += WK)
             {
@@ -227,7 +228,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
             }
             wgmma_commit_group();
             wgmma_wait_group_0();
-            
+
             fence_accumulator(d);
 
 
