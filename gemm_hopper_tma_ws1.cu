@@ -218,7 +218,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
             }
             wgmma_commit_group();
             wgmma_wait_group_0();
-            asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(shared_addr(&empty[slot])) : "memory");
+            asm volatile("mbarrier.arrive.shared::cta.b64 [%0];" ::"r"(shared_addr(&empty[slot])) : "memory");
         }
 
         // PTX's m64nNk16 FP32 accumulator layout for a 128-thread warpgroup:
