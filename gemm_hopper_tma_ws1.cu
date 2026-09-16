@@ -138,6 +138,14 @@ __device__ __forceinline__ void wgmma_m64n64k16_f32_f16_f16(
         : "l"(desc_a), "l"(desc_b), "r"(scale_d)
         : "memory");
 }
+__device__ __forceinline__
+void fence_accumulator(float (&d)[32])
+{
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        asm volatile("" : "+f"(d[i]) :: "memory");
+    }
+}
 
 __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_constant__ CUtensorMap mapA,
                                                                 const __grid_constant__ CUtensorMap mapB, float *C)
@@ -201,6 +209,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
     else if (tid < WARP_GROUP_THREADS)
     {
         float d[32] = {};
+        fence_accumulator(d);
         wgmma_fence();
 #pragma unroll 1
         for (int t = 0; t < K / BK; ++t)
@@ -218,6 +227,10 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
             }
             wgmma_commit_group();
             wgmma_wait_group_0();
+            
+            fence_accumulator(d);
+
+
             asm volatile(
                 "mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(shared_addr(&empty[slot]))
                 : "memory");
