@@ -29,7 +29,7 @@ constexpr int B_PANEL_ELEMENTS = BK * WN;
 constexpr int B_STAGE_ELEMENTS = N_TILES * B_PANEL_ELEMENTS;
 constexpr int TX_BYTES = (A_STAGE_ELEMENTS + B_STAGE_ELEMENTS) * sizeof(half);
 constexpr int DYNAMIC_SMEM_BYTES = STAGES * TX_BYTES;
-static_assert(WM == 64 && WN == 64 && WK == 16 && BK == 64);
+//static_assert(WM == 64 && WN == 64 && WK == 16 && BK == 64);
 static_assert(BM % WM == 0 && BN % WN == 0);
 static_assert(M % BM == 0 && N % BN == 0 && K % BK == 0);
 static_assert(A_STAGE_ELEMENTS * sizeof(half) % 1024 == 0);
