@@ -46,7 +46,7 @@ constexpr int TX_BYTES = ((BM * BK) + (BK * BN)) * sizeof(half); // A+B = 24576 
         }                                                                                        \
     } while (0)
 
-static CUtensorMap encode_map(half *ptr, uint64_t inner, uint64_t outer, uint64_t innerB, uint64_t outerB)
+static CUtensorMap encode_map(half *ptr, uint64_t inner, uint64_t outer, cuuint32_t innerB, cuuint32_t outerB)
 {
     alignas(64) CUtensorMap map{};
     const cuuint64_t dims[2] = {inner, outer};
