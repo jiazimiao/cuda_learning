@@ -4,7 +4,8 @@
 // Search "TMA CHANGE" for differences from the validated manual-copy version.
 // CUDA 12+; Hopper sm_90a. No architecture fallback.
 // Kernel timing excludes allocation, H2D, tensor-map creation and validation.
-// 也改了写回
+// 在gemm_hopper_tma_ws的基础上进一步尝试增加N维
+
 #include <cuda.h> // [TMA CHANGE 1] Host tensor-map encoder
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -16,8 +17,8 @@
 #include <cstring>
 #include <vector>
 constexpr int M = 4096, N = 4096, K = 4096;
-constexpr int BM = 2048, BN = 64, BK = 64;
-constexpr int WM = 64, WN = 64, WK = 16, STAGES = 4;
+constexpr int BM = 1024, BN = 64, BK = 64;
+constexpr int WM = 64, WN = 64, WK = 16, STAGES = 3;
 constexpr int M_TILES = BM / WM;
 constexpr int N_TILES = BN / WN;
 constexpr int WARP_GROUP_THREADS = 128;
