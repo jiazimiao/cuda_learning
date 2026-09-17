@@ -17,12 +17,12 @@
 #include <cstring>
 #include <vector>
 constexpr int M = 4096, N = 4096, K = 4096;
-constexpr int WM = 64, WN = 64, WK = 16, BK = 64, STAGES = 2;
+constexpr int WM = 64, WN = 64, WK = 16, BK = 64, STAGES = 4;
 constexpr int WARP_GROUP_THREADS = 128;
 constexpr int BLOCK_THREADS = 160; // 160threads ; 128 threads for WGMMA, 32 threads for TMA async proxy
 constexpr int FIRST_PRODUCER = 128;
 // [TILE128 1] Block tile vs instruction tile. This layout is specialized to BK=64.
-constexpr int BM = 256, BN = 256;
+constexpr int BM = 128, BN = 128;
 constexpr int M_TILES = BM / WM, N_TILES = BN / WN;
 constexpr int A_STAGE_ELEMENTS = BM * BK;
 constexpr int B_PANEL_ELEMENTS = BK * WN;
