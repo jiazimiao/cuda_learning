@@ -16,8 +16,10 @@
 #include <cstring>
 #include <vector>
 constexpr int M = 4096, N = 4096, K = 4096;
-constexpr int BM = 512, BN = 64, BK = 64;
+constexpr int BM = 1024, BN = 128, BK = 64;
 constexpr int WM = 64, WN = 64, WK = 16, STAGES = 4;
+constexpr int M_TILES = BM / WM;
+constexpr int N_TILES = BN / WN;
 constexpr int WARP_GROUP_THREADS = 128;
 constexpr int BLOCK_THREADS = 160; // 160threads ; 128 threads for WGMMA, 32 threads for TMA async proxy
 constexpr int FIRST_PRODUCER = 128;
@@ -213,7 +215,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
 
         static_assert(BM % WM == 0, "BM must be divisible by WM");
 
-        constexpr int M_TILES = BM / WM;
+        
         float d[M_TILES][32] = {};
         for (int tile = 0; tile < M_TILES; ++tile)
             fence_accumulator(d[tile]);
