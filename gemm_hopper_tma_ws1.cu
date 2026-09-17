@@ -16,12 +16,13 @@
 #include <cstring>
 #include <vector>
 constexpr int M = 4096, N = 4096, K = 4096;
-constexpr int WM = 64, WN = 64, WK = 16, BK = 64, STAGES = 4;
+constexpr int BM = 128, BN = 64, BK = 64;
+constexpr int WM = 64, WN = 64, WK = 16, STAGES = 4;
 constexpr int WARP_GROUP_THREADS = 128;
 constexpr int BLOCK_THREADS = 160; // 160threads ; 128 threads for WGMMA, 32 threads for TMA async proxy
 constexpr int FIRST_PRODUCER = 128;
-constexpr int TILE_ELEMENTS = 64 * 64;
-constexpr int TX_BYTES = 2 * TILE_ELEMENTS * sizeof(half); // A+B = 16384 bytes
+
+constexpr int TX_BYTES = ((BM * BK) + (BK * BN)) * sizeof(half); // A+B = 24576 bytes
 #define CUDA_CHECK(call)                                                                    \
     do                                                                                      \
     {                                                                                       \
@@ -45,12 +46,12 @@ constexpr int TX_BYTES = 2 * TILE_ELEMENTS * sizeof(half); // A+B = 16384 bytes
         }                                                                                        \
     } while (0)
 
-static CUtensorMap encode_map(half *ptr, uint64_t inner, uint64_t outer)
+static CUtensorMap encode_map(half *ptr, uint64_t inner, uint64_t outer, uint64_t innerB, uint64_t outerB)
 {
     alignas(64) CUtensorMap map{};
     const cuuint64_t dims[2] = {inner, outer};
     const cuuint64_t strides[1] = {inner * sizeof(half)};
-    const cuuint32_t box[2] = {64, 64}, element_strides[2] = {1, 1};
+    const cuuint32_t box[2] = {innerB, outerB}, element_strides[2] = {1, 1};
     DRIVER_CHECK(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
                                         2, ptr, dims, strides, box, element_strides,
                                         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
@@ -151,13 +152,13 @@ __device__ __forceinline__ void fence_accumulator(float (&d)[32])
 __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_constant__ CUtensorMap mapA,
                                                                 const __grid_constant__ CUtensorMap mapB, float *C)
 {
-    __shared__ __align__(1024) half sA[STAGES][TILE_ELEMENTS];
-    __shared__ __align__(1024) half sB[STAGES][TILE_ELEMENTS];
+    __shared__ __align__(1024) half sA[STAGES][BM * BK];
+    __shared__ __align__(1024) half sB[STAGES][BK * BN];
     // __shared__ __align__(8) uint64_t ready[STAGES];
     __shared__ __align__(8) uint64_t full[STAGES];
     __shared__ __align__(8) uint64_t empty[STAGES];
     const int tid = threadIdx.x;
-    const int block_m = blockIdx.y * WM, block_n = blockIdx.x * WN;
+    const int block_m = blockIdx.y * BM, block_n = blockIdx.x * BN;
     if (tid == FIRST_PRODUCER)
     {
 #pragma unroll
@@ -209,8 +210,9 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
     // only after ALL WGMMA reads of t have completed.
     else if (tid < WARP_GROUP_THREADS)
     {
-        float d[32] = {};
-        fence_accumulator(d);
+        float d[2][32] = {};
+        fence_accumulator(d[0]);
+        fence_accumulator(d[1]);
 
 #pragma unroll 1
         for (int t = 0; t < K / BK; ++t)
@@ -223,14 +225,18 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
 #pragma unroll
             for (int kk = 0; kk < BK; kk += WK)
             {
-                const uint64_t da = make_desc(sA[slot] + kk, 16);
+                const uint64_t da0 = make_desc(sA[slot] + kk, 16);
                 const uint64_t db = make_desc(sB[slot] + kk * WN, 8192);
-                wgmma_m64n64k16_f32_f16_f16(d, da, db);
+                wgmma_m64n64k16_f32_f16_f16(d[0], da0, db);
+
+                const uint64_t da1 = make_desc(sA[slot] + WM * BK + kk, 16);
+                wgmma_m64n64k16_f32_f16_f16(d[1], da1, db);
             }
             wgmma_commit_group();
             wgmma_wait_group_0();
 
-            fence_accumulator(d);
+            fence_accumulator(d[0]);
+            fence_accumulator(d[1]);
 
             asm volatile(
                 "mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(shared_addr(&empty[slot]))
@@ -257,24 +263,28 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
         //         }
         static_assert(N % 2 == 0, "float2 stores require an even row stride");
 
-#pragma unroll
-        for (int group = 0; group < 8; ++group)
+        for (int tile = 0; tile < BM / WM; ++tile)
         {
-            const int c = block_n + group * 8 + col2;
-            const int r = group * 4;
 
-            const size_t index0 =
-                static_cast<size_t>(block_m + row0) * N + c;
+#pragma unroll
+            for (int group = 0; group < 8; ++group)
+            {
+                const int c = block_n + group * 8 + col2;
+                const int r = group * 4;
 
-            const size_t index1 =
-                static_cast<size_t>(block_m + row0 + 8) * N + c;
+                const size_t index0 =
+                    static_cast<size_t>(block_m + tile * WM + row0) * N + c;
 
-            // [改动] 两个相邻 FP32 合成一个 float2 写出。
-            *reinterpret_cast<float2 *>(C + index0) =
-                make_float2(d[r + 0], d[r + 1]);
+                const size_t index1 =
+                    static_cast<size_t>(block_m + tile * WM + row0 + 8) * N + c;
 
-            *reinterpret_cast<float2 *>(C + index1) =
-                make_float2(d[r + 2], d[r + 3]);
+                // [改动] 两个相邻 FP32 合成一个 float2 写出。
+                *reinterpret_cast<float2 *>(C + index0) =
+                    make_float2(d[tile][r + 0], d[tile][r + 1]);
+
+                *reinterpret_cast<float2 *>(C + index1) =
+                    make_float2(d[tile][r + 2], d[tile][r + 3]);
+            }
         }
     }
     __syncthreads();
@@ -367,10 +377,10 @@ int main(int argc, char **argv)
 
     // [TMA CHANGE 5] Tensor-map dimensions are fastest-first; no transpose.
     // A coordinates {k,m}, B coordinates {n,k}. Each box is 64x64 FP16.
-    alignas(64) CUtensorMap mapA = encode_map(dA, K, M);
-    alignas(64) CUtensorMap mapB = encode_map(dB, N, K);
+    alignas(64) CUtensorMap mapA = encode_map(dA, K, M, BK, BM);
+    alignas(64) CUtensorMap mapB = encode_map(dB, N, K, BN, BK);
     const dim3 block(BLOCK_THREADS);
-    const dim3 grid(N / WN, M / WM);
+    const dim3 grid(N / BN, M / BM);
     for (int i = 0; i < 5; ++i)
         wgmma_gemm_tma<<<grid, block>>>(mapA, mapB, dC);
     CUDA_CHECK(cudaGetLastError());
