@@ -16,7 +16,7 @@
 #include <cstring>
 #include <vector>
 constexpr int M = 4096, N = 4096, K = 4096;
-constexpr int BM = 1024, BN = 128, BK = 64;
+constexpr int BM = 1024, BN = 64, BK = 64;
 constexpr int WM = 64, WN = 64, WK = 16, STAGES = 4;
 constexpr int M_TILES = BM / WM;
 constexpr int N_TILES = BN / WN;
