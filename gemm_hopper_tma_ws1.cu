@@ -16,7 +16,7 @@
 #include <cstring>
 #include <vector>
 constexpr int M = 4096, N = 4096, K = 4096;
-constexpr int BM = 128, BN = 64, BK = 64;
+constexpr int BM = 256, BN = 64, BK = 64;
 constexpr int WM = 64, WN = 64, WK = 16, STAGES = 4;
 constexpr int WARP_GROUP_THREADS = 128;
 constexpr int BLOCK_THREADS = 160; // 160threads ; 128 threads for WGMMA, 32 threads for TMA async proxy
@@ -210,9 +210,13 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
     // only after ALL WGMMA reads of t have completed.
     else if (tid < WARP_GROUP_THREADS)
     {
-        float d[2][32] = {};
-        fence_accumulator(d[0]);
-        fence_accumulator(d[1]);
+       
+        static_assert(BM % WM == 0, "BM must be divisible by WM");
+
+        constexpr int M_TILES = BM / WM;
+        float d[M_TILES][32] = {};
+        for (int tile = 0; tile < M_TILES; ++tile)
+            fence_accumulator(d[tile]);
 
 #pragma unroll 1
         for (int t = 0; t < K / BK; ++t)
@@ -235,8 +239,8 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
             wgmma_commit_group();
             wgmma_wait_group_0();
 
-            fence_accumulator(d[0]);
-            fence_accumulator(d[1]);
+           for (int tile = 0; tile < M_TILES; ++tile)
+            fence_accumulator(d[tile]);
 
             asm volatile(
                 "mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(shared_addr(&empty[slot]))
@@ -263,7 +267,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
         //         }
         static_assert(N % 2 == 0, "float2 stores require an even row stride");
 
-        for (int tile = 0; tile < BM / WM; ++tile)
+        for (int tile = 0; tile < M_TILES; ++tile)
         {
 
 #pragma unroll
