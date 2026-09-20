@@ -1,5 +1,6 @@
 // Derived from gemm_hopper_tma_ws2.cu: one committed WGMMA group per K tile,
 // with separate submission and shared-memory release positions.
+// Descriptor bases are built once; stage/MMA offsets use 16-byte address units.
 // nvcc -O3 -std=c++17 -lineinfo -arch=sm_90a gemm_hopper_tma_ws2_pipeline.cu -lcuda -o gemm_ws_pipeline
 // Standalone TMA version. Original manual-copy file is preserved.
 // nvcc -O3 -std=c++17 -lineinfo -gencode arch=compute_90a,code=sm_90a \
@@ -32,11 +33,14 @@ constexpr int TX_BYTES = (A_STAGE_ELEMENTS + B_STAGE_ELEMENTS) * sizeof(half);
 constexpr int DYNAMIC_SMEM_BYTES = STAGES * TX_BYTES;
 static_assert(STAGES >= 2, "One outstanding WGMMA group requires at least two slots");
 static_assert(K >= BK, "The WGMMA prologue requires at least one K tile");
-//static_assert(WM == 64 && WN == 64 && WK == 16 && BK == 64);
+static_assert(WM == 64 && WN == 64 && WK == 16 && BK == 64,
+              "Descriptor offsets below require the m64n64k16 SW128 layout");
 static_assert(BM % WM == 0 && BN % WN == 0);
 static_assert(M % BM == 0 && N % BN == 0 && K % BK == 0);
 static_assert(A_STAGE_ELEMENTS * sizeof(half) % 1024 == 0);
 static_assert(B_PANEL_ELEMENTS * sizeof(half) % 1024 == 0);
+constexpr uint32_t A_STAGE_DESC_STRIDE = A_STAGE_ELEMENTS * sizeof(half) / 16;
+constexpr uint32_t B_STAGE_DESC_STRIDE = B_STAGE_ELEMENTS * sizeof(half) / 16;
 #define CUDA_CHECK(call)                                                                    \
     do                                                                                      \
     {                                                                                       \
@@ -177,7 +181,8 @@ void fence_accumulator(float (&d)[32])
 // Submit exactly one committed group for one K tile. All 128 consumers call
 // this together. The caller waits for completion before recycling this slot.
 __device__ __forceinline__ void issue_stage(
-    const half *sa, const half *sb, float (&d)[M_TILES][N_TILES][32])
+    uint64_t desc_a_stage, uint64_t desc_b_stage,
+    float (&d)[M_TILES][N_TILES][32])
 {
 #pragma unroll
     for (int tm = 0; tm < M_TILES; ++tm)
@@ -190,12 +195,17 @@ __device__ __forceinline__ void issue_stage(
     for (int kk = 0; kk < BK; kk += WK) {
 #pragma unroll
         for (int tm = 0; tm < M_TILES; ++tm) {
-            const uint64_t da = make_desc(sa + tm * WM * BK + kk, 16);
+            // The unrolled offsets affect only the descriptor start-address
+            // field (bits 0..13, in 16-byte units). Valid Hopper shared-memory
+            // addresses stay below 256 KiB, so no carry reaches other fields.
+            // A slices stay in the first 128B row; B slices advance by 2048B.
+            // Thus the SW128 base-offset field remains zero, as in make_desc.
+            const uint64_t da = desc_a_stage +
+                (tm * WM * BK + kk) * sizeof(half) / 16;
 #pragma unroll
             for (int tn = 0; tn < N_TILES; ++tn) {
-                const uint64_t db = make_desc(
-                    sb + tn * B_PANEL_ELEMENTS + kk * WN,
-                    B_PANEL_ELEMENTS * sizeof(half));
+                const uint64_t db = desc_b_stage +
+                    (tn * B_PANEL_ELEMENTS + kk * WN) * sizeof(half) / 16;
                 wgmma_m64n64k16_f32_f16_f16(d[tm][tn], da, db);
             }
         }
@@ -206,7 +216,7 @@ __device__ __forceinline__ void issue_stage(
 __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_constant__ CUtensorMap mapA,
                                                                 const __grid_constant__ CUtensorMap mapB, float *C)
 {
-    // Dynamic data storage: STAGES * TX_BYTES, 72 KiB for 128x64 and 3 stages.
+    // Dynamic data storage: STAGES * TX_BYTES, 96 KiB for 128x128 and 3 stages.
     // Every A stage and B panel starts on a 1024-byte boundary.
     extern __shared__ __align__(1024) half storage[];
     half (*sA)[A_STAGE_ELEMENTS] =
@@ -273,10 +283,18 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
         // M_TILES * N_TILES independent 64x64 output fragments per warpgroup.
         float d[M_TILES][N_TILES][32] = {};
 
+        // Convert generic pointers and assemble invariant descriptor fields
+        // once, outside the K loop. These bases are identical for all consumers.
+        // Keep only two bases, rather than a dynamically indexed descriptor
+        // array that could increase register pressure or introduce local loads.
+        const uint64_t desc_a_base = make_desc(sA[0], 16);
+        const uint64_t desc_b_base =
+            make_desc(sB[0], B_PANEL_ELEMENTS * sizeof(half));
+
         // Prologue: tile 0 uses slot 0, generation 0. Leave its group in flight;
         // neither wait for all WGMMA nor signal empty[0] here.
         wait_stage(&full[0], 0);
-        issue_stage(sA[0], sB[0], d);
+        issue_stage(desc_a_base, desc_b_base, d);
 
 #pragma unroll 1
         for (int t = 1; t < K / BK; ++t)
@@ -286,7 +304,8 @@ __global__ __launch_bounds__(BLOCK_THREADS) void wgmma_gemm_tma(const __grid_con
 
             // The previous group can execute during this data wait and setup.
             wait_stage(&full[read_slot], generation & 1);
-            issue_stage(sA[read_slot], sB[read_slot], d);
+            issue_stage(desc_a_base + uint64_t(read_slot) * A_STAGE_DESC_STRIDE,
+                        desc_b_base + uint64_t(read_slot) * B_STAGE_DESC_STRIDE, d);
 
             // Only the newest committed group (tile t) may remain incomplete.
             // This is not permission to recycle read_slot.
@@ -388,7 +407,7 @@ static float reference_element(int row, int col, bool identity_a, bool identity_
 
 int main(int argc, char **argv)
 {
-    std::printf("Layout revision: WS-Bpanels-SW128-read-release-wait1\n");
+    std::printf("Layout revision: WS-Bpanels-SW128-read-release-wait1-desc-base\n");
     DRIVER_CHECK(cuInit(0));
     const bool identity_a = argc == 2 && std::strcmp(argv[1], "--identity-a") == 0;
     const bool identity_b = argc == 2 && std::strcmp(argv[1], "--identity-b") == 0;
